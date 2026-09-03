@@ -70,6 +70,15 @@ interface BeforeCompactEventLike {
 	preparation: { tokensBefore: number };
 }
 
+/** Max lines in the bootstrap user-request index (most recent kept on overflow). */
+const USER_REQUEST_INDEX_LIMIT = 25;
+/** Max lines in the bootstrap recently-edited-files index (Claude Code re-reads 5). */
+const EDITED_FILE_INDEX_LIMIT = 5;
+/** Tool names whose `path` argument mutates a file and is worth indexing. */
+const FILE_EDIT_TOOL_NAMES = new Set(["edit", "write", "multiedit"]);
+
+const truncatePath = (p: string): string => (p.length > 160 ? `${p.slice(0, 157)}...` : p);
+
 export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	const bundle: ConfigBundle = loadConfig();
 	/** Effective config for the active model (memoized per provider/model). */
@@ -180,15 +189,66 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	 * Cumulative user-request index (id — preview) across ALL windows in the
 	 * session tree, embedded in every bootstrap. System-guaranteed so the new
 	 * window can never lose sight of what the user asked for, even when the
-	 * model never recorded ids in notes.
+	 * model never recorded ids in notes. When the index overflows it keeps the
+	 * MOST RECENT requests (the newest is the one most likely still being
+	 * solved) and points at history for the omitted older ones.
 	 */
 	function userRequestLines(branch: Array<{ id: string; type: string; summary?: string; customType?: string }>): string[] {
 		const items = new HistoryStore(branch as never).listItems({
 			role: "user",
-			limit: 25,
 			previewChars: 160,
 		});
-		return items.map((i) => `${i.itemId} — ${i.preview.replace(/\s+/g, " ")}`);
+		const omitted = Math.max(0, items.length - USER_REQUEST_INDEX_LIMIT);
+		const kept = omitted > 0 ? items.slice(-USER_REQUEST_INDEX_LIMIT) : items;
+		const lines = kept.map((i) => `${i.itemId} — ${i.preview.replace(/\s+/g, " ")}`);
+		if (omitted > 0) {
+			lines.unshift(
+				`(${omitted} older user request(s) not shown — list them with history list_items role "user", then read_item by id)`,
+			);
+		}
+		return lines;
+	}
+
+	/**
+	 * Bounded index of files edited via edit/write tool calls across ALL
+	 * windows, embedded in every bootstrap. The file analog of the user-request
+	 * index: system-guaranteed so the new window knows which files were being
+	 * changed even when the model never recorded them in notes. Each line
+	 * points at the item id of the most recent edit; read_item on it shows the
+	 * exact change. Pull-based (paths + ids only): file contents are re-read on
+	 * demand, never auto-injected.
+	 */
+	function editedFileLines(branch: LooseEntry[]): string[] {
+		const touches: Array<{ path: string; itemId: string }> = [];
+		for (const entry of branch) {
+			if (entry.type !== "message") continue;
+			const msg = (entry as { message?: { role?: string; content?: unknown } }).message;
+			if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+			for (const block of msg.content as Array<Record<string, unknown>>) {
+				if (!block || typeof block !== "object" || block.type !== "toolCall") continue;
+				const name = typeof block.name === "string" ? block.name.toLowerCase() : "";
+				if (!FILE_EDIT_TOOL_NAMES.has(name)) continue;
+				const args = (block.arguments ?? block.input ?? {}) as Record<string, unknown>;
+				const p = typeof args.path === "string" ? args.path.trim() : "";
+				if (p) touches.push({ path: p, itemId: entry.id });
+			}
+		}
+		if (touches.length === 0) return [];
+		// Dedupe by path keeping the most recent touch, order by recency.
+		const lastTouch = new Map<string, { path: string; itemId: string; seq: number }>();
+		touches.forEach((t, i) => lastTouch.set(t.path, { ...t, seq: i }));
+		const recent = [...lastTouch.values()].sort((a, b) => b.seq - a.seq); // newest first
+		const lines = recent
+			.slice(0, EDITED_FILE_INDEX_LIMIT)
+			.reverse() // chronological order for readability
+			.map((t) => `${truncatePath(t.path)} (last edit: ${t.itemId})`);
+		const omitted = recent.length - Math.min(recent.length, EDITED_FILE_INDEX_LIMIT);
+		if (omitted > 0) {
+			lines.unshift(
+				`(${omitted} other file(s) also edited — recover those edits with history search_contents "[tool_call", or list_items role "assistant")`,
+			);
+		}
+		return lines;
 	}
 
 	/** Whether the current window already has its identity/guidance message. */
@@ -219,9 +279,10 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			currentWindowId: pendingWindow.id,
 			windowNumber: pendingWindow.number,
 		};
+		const branch = event.branchEntries as LooseEntry[];
 		return {
 			compaction: {
-				summary: bootstrapText(identity, userRequestLines(event.branchEntries as never)),
+				summary: bootstrapText(identity, userRequestLines(branch), editedFileLines(branch)),
 				// Sentinel id that matches no entry: the new window keeps nothing
 				// from the old conversation (pi keeps entries from this id only).
 				firstKeptEntryId: `token-budget-rollover-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,

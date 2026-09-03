@@ -259,6 +259,49 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	h.cleanup();
 }
 
+// Bootstrap indexes keep the most recent entries: user requests (recency on
+// overflow + omission pointer) and edited files (dedupe by path, recency,
+// bounded, omission pointer).
+{
+	const h = createHarness("bootstrap-indexes");
+	const branch = h.getBranch();
+	for (let i = 1; i <= 30; i++) {
+		branch.push({
+			id: `u-${i}`,
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: `request ${i} fix the login flow` }] },
+		});
+		branch.push({
+			id: `a-${i}`,
+			type: "message",
+			message: { role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: `src/file${i}.ts` } }] },
+		});
+	}
+	// Re-edit an early file late: dedupe must keep the newest item id.
+	branch.push({
+		id: "a-re",
+		type: "message",
+			message: { role: "assistant", content: [{ type: "toolCall", name: "write", arguments: { path: "src/file1.ts" } }] },
+	});
+
+	const summary = (h.threshold("manual") as CompactResult).compaction!.summary;
+	// User requests: newest 25 of 30 kept, chronological, 5 omitted with pointer.
+	assert.ok(summary.includes("u-6 —"), "25th-from-last user request indexed");
+	assert.ok(summary.includes("u-30 —"), "newest user request indexed");
+	assert.ok(!summary.includes("u-5 —"), "older-than-25 user request dropped");
+	assert.ok(summary.indexOf("u-6 —") < summary.indexOf("u-30 —"), "index stays chronological");
+	assert.match(summary, /5 older user request\(s\) not shown/);
+	assert.match(summary, /list_items role "user"/);
+	// Edited files: 30 distinct paths -> 5 kept, file1 deduped to its latest edit.
+	assert.ok(summary.includes("Files edited in this session"));
+	assert.ok(summary.includes("src/file1.ts (last edit: a-re)"), "dedupe keeps most recent edit id");
+	assert.ok(summary.includes("src/file30.ts (last edit: a-30)"));
+	assert.ok(!summary.includes("src/file2.ts"), "file edited only early is dropped");
+	assert.match(summary, /25 other file\(s\) also edited/);
+	assert.match(summary, /search_contents "\[tool_call"/);
+	h.cleanup();
+}
+
 // A stale old-window fallback is not evidence for the current window.
 {
 	const h = createHarness("stale-source");

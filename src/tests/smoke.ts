@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { DEFAULTS, reminderThreshold, resolveForModel, type ConfigBundle } from "../config.ts";
 import { HistoryStore } from "../stores/history-store.ts";
 import { NotesStore } from "../stores/notes-store.ts";
-import { BOOTSTRAP_MARKER, bootstrapText, reminderMessage } from "../prompts.ts";
+import { BOOTSTRAP_MARKER, bootstrapText, guidanceMessage, reminderMessage } from "../prompts.ts";
 import { notesBloatWarnings } from "../tools/deps.ts";
 import { commitRollover, freshState, inferFromBranch, loadState, saveState } from "../state.ts";
 
@@ -79,6 +79,17 @@ const bootWithReqs = bootstrapText({ firstWindowId: "w-a", previousWindowId: "w-
 assert.ok(bootWithReqs.includes("User requests from this session"));
 assert.ok(bootWithReqs.includes("u1 — please ship the plugin"));
 assert.ok(bootWithReqs.includes("u2 — also add tests"));
+assert.ok(!boot.includes("Files edited in this session"), "empty file index omits the section");
+const bootWithFiles = bootstrapText(
+	{ firstWindowId: "w-a", previousWindowId: "w-b", currentWindowId: "w-c", windowNumber: 5 },
+	["u1 — please ship the plugin"],
+	["src/auth.ts (last edit: e17)", "(2 other file(s) also edited — recover those edits with history search_contents \"[tool_call\", or list_items role \"assistant\")"],
+);
+assert.ok(bootWithFiles.includes("Files edited in this session"));
+assert.ok(bootWithFiles.includes("src/auth.ts (last edit: e17)"));
+assert.ok(bootWithFiles.includes("2 other file(s) also edited"));
+assert.ok(guidanceMessage({ firstWindowId: "w-a", previousWindowId: null, currentWindowId: "w-c", windowNumber: 1 }).includes("verbatim"), "guidance requires verbatim quotes");
+assert.ok(reminderMessage("w-c", 1234).includes("verbatim"), "reminder requires verbatim quotes");
 assert.ok(reminderMessage("w-c", 1234).includes("only 1234 tokens remain"));
 assert.ok(reminderMessage("w-c", 1234).includes('source_context_window_id="w-c"'));
 assert.ok(reminderMessage("w-c", 1234).includes("clean up old notes"), "generic cleanup advice when no bloat");

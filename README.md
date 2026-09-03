@@ -27,7 +27,8 @@ Remaining ≤ threshold ──► One-shot reminder (steered to the next model
                                                     converted to a forced
                                                     no-summary rollover
 New window = bootstrap block (window identity + recovery protocol
-  + cross-window user-request index) + fresh initial context
+  + cross-window user-request index + recently-edited-files index)
+  + fresh initial context
   └─ The model reads notes to recover the big picture; details are
      re-read on demand via history by item id
 ```

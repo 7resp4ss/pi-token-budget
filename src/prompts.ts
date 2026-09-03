@@ -40,7 +40,7 @@ export function guidanceMessage(identity: WindowIdentity): string {
 	return [
 		`<context_window>\n${identityBlock(identity)}\n</context_window>`,
 		"",
-		`For tasks that may span context windows, use the notes tool to maintain a concise checkpoint of the goal, decisions, progress, learnings, and next steps. Include the item id of every relevant user request you are currently solving as well as important actions and tool calls. Take incremental notes while you work so you do not miss important info.`,
+		`For tasks that may span context windows, use the notes tool to maintain a concise checkpoint of the goal, decisions, progress, learnings, and next steps. Include the item id of every relevant user request you are currently solving as well as important actions and tool calls. When recording user requirements or key decisions, quote the user's key phrases verbatim (with their item ids) instead of fully paraphrasing them — paraphrase drift compounds across windows. Take incremental notes while you work so you do not miss important info.`,
 		"",
 		`Use the get_context_remaining tool to plan around the remaining token budget. When the budget is nearly exhausted you will receive one reminder; after saving your notes, call the new_context tool to continue in a fresh context window. Once the budget is exhausted, the current window is discarded without any summary and you can only recover through notes and the history tool.`,
 		"",
@@ -66,11 +66,27 @@ export function userRequestsSection(lines: string[]): string {
 }
 
 /**
+ * Bounded index of recently edited files (path — last-edit item id) embedded
+ * in every window bootstrap. Pull-based recovery: only paths and ids cross
+ * the window boundary; contents are re-read on demand (unlike push-based
+ * auto re-injection, which would spend fresh-window tokens whether needed
+ * or not).
+ */
+export function editedFilesSection(lines: string[]): string {
+	if (lines.length === 0) return "";
+	return [
+		"",
+		"Files edited in this session so far (path — item id of the most recent edit). Re-read whichever ones the task still needs; read_item on an id shows the exact edit made:",
+		...lines,
+	].join("\n");
+}
+
+/**
  * Bootstrap text for a rolled-over window. This becomes the compaction
  * "summary" (pi wraps it in a summary prefix, so the first line explicitly
  * redirects: it is a reset notice, not a conversation summary).
  */
-export function bootstrapText(identity: WindowIdentity, userRequests: string[] = []): string {
+export function bootstrapText(identity: WindowIdentity, userRequests: string[] = [], editedFiles: string[] = []): string {
 	return [
 		BOOTSTRAP_MARKER,
 		"Context window reset. This is NOT a conversation summary: the previous window was discarded without summarization. You are now in a fresh context window.",
@@ -85,6 +101,7 @@ export function bootstrapText(identity: WindowIdentity, userRequests: string[] =
 		"",
 		`Continue taking incremental notes in this window, and call new_context (after saving notes) when this window is no longer useful.`,
 		userRequestsSection(userRequests),
+		editedFilesSection(editedFiles),
 	].join("\n");
 }
 
@@ -125,7 +142,7 @@ export function reminderMessage(currentWindowId: string, remainingTokens: number
 			: ["It is also a good idea to clean up old notes that have become obsolete."];
 	return [
 		`<context_window_reminder source_context_window_id="${currentWindowId}">`,
-		`Your current context window is nearly exhausted; only ${remainingTokens} tokens remain. Before starting a new context window, save concise progress notes with the notes tool: the goal, decisions, progress, learnings, next steps, and the item id of every relevant user request still being solved, as well as important actions and tool calls for future reference. Write or append notes in a way that best helps you recover in a new context window.`,
+		`Your current context window is nearly exhausted; only ${remainingTokens} tokens remain. Before starting a new context window, save concise progress notes with the notes tool: the goal, decisions, progress, learnings, next steps, and the item id of every relevant user request still being solved, as well as important actions and tool calls for future reference. When recording the user's requirements, quote their key phrases verbatim (with item ids) rather than fully paraphrasing, so meaning does not drift across windows. Write or append notes in a way that best helps you recover in a new context window.`,
 		``,
 		...cleanup,
 		``,
