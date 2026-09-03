@@ -1,6 +1,6 @@
 {
 	"name": "pi-token-budget",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"description": "Token-budget context window management for pi: no-summary window rollover, notes checkpoints, and read-only history recovery. Replaces summarization compaction.",
 	"type": "module",
 	"license": "MIT",
