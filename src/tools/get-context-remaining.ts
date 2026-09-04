@@ -9,7 +9,7 @@
  * a rollover until the next response reports usage — mirroring codex.
  *
  * Output shape (one bounded sentence, plus optional notes-bloat hints):
- *   "You have 4231 tokens left in this context window. (window w2)"
+ *   "You have 4231 tokens left in this context window. (window w{N})"
  */
 
 import { Type } from "typebox";
