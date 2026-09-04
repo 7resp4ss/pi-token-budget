@@ -39,10 +39,10 @@ import {
 import {
 	commitRollover,
 	freshState,
-	generateWindowId,
 	inferFromBranch,
 	loadState,
 	saveState,
+	windowIdFor,
 	type PendingWindow,
 	type WindowState,
 } from "./state.ts";
@@ -272,7 +272,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		// not to the manual/overflow reason that happened to commit it.
 		continueAfterRollover = state.pendingNewContext || state.fallbackActive;
 
-		pendingWindow = { id: generateWindowId(), number: state.windowNumber + 1 };
+		pendingWindow = { id: windowIdFor(state.windowNumber + 1), number: state.windowNumber + 1 };
 		const identity = {
 			firstWindowId: state.firstWindowId,
 			previousWindowId: state.currentWindowId,

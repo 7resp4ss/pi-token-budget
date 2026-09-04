@@ -9,7 +9,7 @@
  * a rollover until the next response reports usage — mirroring codex.
  *
  * Output shape (one bounded sentence, plus optional notes-bloat hints):
- *   "You have 4231 tokens left in this context window. (window 2, id w-abc123)"
+ *   "You have 4231 tokens left in this context window. (window w2)"
  */
 
 import { Type } from "typebox";
@@ -22,7 +22,7 @@ export function registerGetContextRemainingTool(pi: ToolRegistrar, deps: ToolDep
 		name: "get_context_remaining",
 		label: "Context Remaining",
 		description:
-			"Get the remaining tokens in the current context window, plus the current window id and number. Use this to plan long tasks and decide when to checkpoint notes or start a new context window. " +
+			"Get the remaining tokens in the current context window, plus the current window id. Use this to plan long tasks and decide when to checkpoint notes or start a new context window. " +
 			TOOL_PRIVATE_USAGE_HINT,
 		promptSnippet: "Check remaining context tokens (get_context_remaining).",
 		parameters: Type.Object({}),
@@ -37,8 +37,8 @@ export function registerGetContextRemainingTool(pi: ToolRegistrar, deps: ToolDep
 			const remaining = deps.remainingTokens(ctx);
 			const text =
 				remaining === null
-					? `You have unknown tokens left in this context window. (window ${state.windowNumber}, id ${state.currentWindowId})`
-					: `You have ${remaining} tokens left in this context window. (window ${state.windowNumber}, id ${state.currentWindowId})`;
+					? `You have unknown tokens left in this context window. (window ${state.currentWindowId})`
+					: `You have ${remaining} tokens left in this context window. (window ${state.currentWindowId})`;
 			const warnings = notesBloatWarnings(() => deps.getNotes(), deps.config);
 			return textResult(warnings.length > 0 ? `${text}\n${warnings.join("\n")}` : text, deps.config);
 		},

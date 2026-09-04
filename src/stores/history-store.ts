@@ -10,6 +10,8 @@
  * return unbounded content.
  */
 
+import { BOOTSTRAP_MARKER } from "../prompts.ts";
+
 export interface HistoryItem {
 	itemId: string;
 	windowId: string;
@@ -93,6 +95,18 @@ function renderEntry(entry: LooseEntry): { role: string; text: string } | null {
 	}
 }
 
+/**
+ * Rollover bootstraps embed the authoritative window id in the compaction
+ * summary; read it back so history labels are the exact tokens the model saw
+ * in that window's bootstrap. Compactions without our marker (foreign
+ * summarization) fall back to ordinal counting.
+ */
+function windowIdFromBootstrap(summary: string | undefined): string | null {
+	if (typeof summary !== "string" || !summary.includes(BOOTSTRAP_MARKER)) return null;
+	const match = summary.match(/^Current context window id: (\S+)$/m);
+	return match ? match[1] : null;
+}
+
 export class HistoryStore {
 	private readonly windows: HistoryWindow[] = [];
 	private readonly items: HistoryItem[] = [];
@@ -109,7 +123,7 @@ export class HistoryStore {
 			if (entry.type === "compaction") {
 				pushWindow();
 				// The compaction entry itself belongs to the new window it opens.
-				windowId = `w${windows.length + 1}`;
+				windowId = windowIdFromBootstrap(entry.summary) ?? `w${windows.length + 1}`;
 				openedByCompaction = true;
 				count = 0;
 			}

@@ -13,7 +13,7 @@
 
 ## get_context_remaining
 
-- **无参数**。返回一句话：`You have {n} tokens left in this context window. (window {N}, id {w-xxxx})`，无数据时 `unknown`
+- **无参数**。返回一句话：`You have {n} tokens left in this context window. (window {wN})`，无数据时 `unknown`
 - 数据源：pi 的 `ctx.getContextUsage()`（最后一条 assistant 的服务端 usage + 尾部估算）
 - 换窗后到下一次 usage 返回之前返回 `unknown`（与 codex 行为一致）
 - notes 膨胀时（阈值从 `notesMaxFileBytes` 派生：单文件 cap/16、总量 cap/4）追加 ⚠ 软警告行，提醒模型精简检查点（次通道；主通道在 reminder 消息内）
@@ -59,4 +59,4 @@
 
 - 所有工具描述末尾附 `TOOL_PRIVATE_USAGE_HINT`（私有簿记，不对用户泄露）
 - 所有输出经 `textResult()` 截断
-- item id / window id 均为不透明字符串，模型原样回传
+- item id 为不透明字符串，模型原样回传；window id 即窗口序号（`w1`、`w2`…），与 bootstrap 身份块、history 标签同源同词

@@ -39,7 +39,7 @@ Rollover carries zero summary: the new window keeps none of the old conversation
 
 | Tool | Description |
 |---|---|
-| `get_context_remaining` | Real-time remaining tokens (pull channel) + current window id/number |
+| `get_context_remaining` | Real-time remaining tokens (pull channel) + current window id (`w1`, `w2`, …) |
 | `new_context` | Declares a rollover (no parameters); executed after the turn ends, environment state is unaffected |
 | `notes` | Virtual-path filesystem: `read/write/append/search/list`, survives across windows, ≤1MB per file; read supports line/char dual pagination; soft warnings on bloat |
 | `history` | Read-only index: `list_windows/list_items/read_item/search_contents`, char-level pagination |

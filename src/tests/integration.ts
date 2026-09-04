@@ -196,7 +196,7 @@ function currentWindowId(h: ReturnType<typeof createHarness>): string {
 	const guidance = h.getBranch().find(
 		(entry) => (entry as { customType?: string }).customType === CUSTOM_TYPE_CONTEXT_WINDOW,
 	) as { content: string };
-	const match = guidance.content.match(/Current context window id: (w-[^\s<]+)/);
+	const match = guidance.content.match(/Current context window id: (w\d+)/);
 	assert.ok(match);
 	return match[1];
 }

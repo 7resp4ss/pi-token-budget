@@ -43,7 +43,7 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-token-budget-smoke-"));
 let st = freshState("s1");
 assert.equal(st.windowNumber, 1);
 assert.equal(st.previousWindowId, null);
-assert.ok(st.currentWindowId.startsWith("w-"));
+assert.equal(st.currentWindowId, "w1", "window id is the ordinal");
 st = { ...st, pendingNewContext: true, reminderDelivered: true, fallbackDelivered: true, fallbackActive: true };
 st = commitRollover(st, { id: "w-next01", number: 2 });
 assert.equal(st.windowNumber, 2);
@@ -63,6 +63,8 @@ const st2 = inferFromBranch(freshState("s1"), [
 	{ type: "message" },
 ]);
 assert.equal(st2.windowNumber, 3);
+assert.equal(st2.currentWindowId, "w3");
+assert.equal(st2.previousWindowId, "w2");
 assert.equal(st2.reminderDelivered, true, "conservative after inference");
 
 // --- prompts ----------------------------------------------------------------
@@ -194,7 +196,7 @@ const branch = [
 	{ id: "e3", type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { cmd: "ls" } }] } },
 	{ id: "e4", type: "message", message: { role: "toolResult", content: [{ type: "text", text: "file.txt" }] } },
 	{ id: "e5", type: "custom_message", content: "reminder injected" },
-	{ id: "e6", type: "compaction", summary: `${BOOTSTRAP_MARKER} fresh window` },
+	{ id: "e6", type: "compaction", summary: bootstrapText({ firstWindowId: "w1", previousWindowId: "w1", currentWindowId: "w2", windowNumber: 2 }) },
 	{ id: "e7", type: "message", message: { role: "assistant", content: [{ type: "text", text: "new window turn" }] } },
 	{ id: "e8", type: "custom", data: {} }, // plugin state entry: excluded
 ];
@@ -227,6 +229,20 @@ assert.deepEqual(
 // tool call rendering is addressable too
 const toolCall = history.readItem("e3", 0, 1000);
 assert.ok(toolCall.text.includes("[tool_call bash]"));
+
+// Compactions without our marker (foreign summarization) fall back to ordinal
+// counting; marked rollovers always take the id embedded in their bootstrap.
+const foreignBranch = [
+	{ id: "f1", type: "message", message: { role: "user", content: [{ type: "text", text: "before foreign compact" }] } },
+	{ id: "f2", type: "compaction", summary: "pi native summary, no marker" },
+	{ id: "f3", type: "message", message: { role: "assistant", content: [{ type: "text", text: "after foreign compact" }] } },
+];
+const foreignHistory = new HistoryStore(foreignBranch as never);
+assert.deepEqual(
+	foreignHistory.listWindows().map((w) => w.windowId),
+	["w1", "w2"],
+);
+assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("smoke: all assertions passed");

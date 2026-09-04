@@ -8,7 +8,9 @@
  * Invariants (see README):
  * - One-shot flags reset only when a window rollover commits.
  * - `pendingNewContext` is consumed exactly once (rollover commit or error).
- * - Window ids are opaque short strings the model can pass back unchanged.
+ * - Window ids are ordinals ("w1", "w2", …) — the single naming scheme
+ *   shared by bootstrap identity blocks, reminder staleness checks, and
+ *   history listings, so the model never has to map between two id spaces.
  */
 
 import * as fs from "node:fs";
@@ -37,14 +39,14 @@ export interface WindowState {
 	hardRolloverLatched: boolean;
 }
 
-let idCounter = 0;
-
-/** Short, opaque, collision-unlikely id (8 hex chars + counter suffix). */
-export function generateWindowId(): string {
-	idCounter = (idCounter + 1) % 0xffff;
-	const rand = Math.floor(Math.random() * 0xffff).toString(16).padStart(4, "0");
-	const ctr = idCounter.toString(16).padStart(4, "0");
-	return `w-${rand}${ctr}`;
+/**
+ * Canonical window id: the ordinal ("w1", "w2", …). Uniqueness only needs to
+ * hold within a session (state and history are both session-scoped), so the
+ * ordinal suffices for reminder staleness checks while staying identical to
+ * the labels the history tool shows the model.
+ */
+export function windowIdFor(number: number): string {
+	return `w${number}`;
 }
 
 export function stateFilePath(sessionDir: string, sessionId: string): string {
@@ -52,7 +54,7 @@ export function stateFilePath(sessionDir: string, sessionId: string): string {
 }
 
 export function freshState(sessionId: string): WindowState {
-	const first = generateWindowId();
+	const first = windowIdFor(1);
 	return {
 		version: 1,
 		sessionId,
@@ -133,9 +135,8 @@ export function inferFromBranch(state: WindowState, branch: Array<{ type: string
 	return {
 		...state,
 		windowNumber: number,
-		// Opaque derived id; only used for identity display after state loss.
-		currentWindowId: `w-resumed-${number}`,
-		previousWindowId: `w-resumed-${number - 1}`,
+		currentWindowId: windowIdFor(number),
+		previousWindowId: windowIdFor(number - 1),
 		reminderDelivered: true, // conservative: avoid duplicate reminders on inference
 		fallbackDelivered: true,
 		pendingNewContext: false,
