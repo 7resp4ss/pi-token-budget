@@ -110,9 +110,19 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	let lastRolloverTimestamp = 0;
 	/** Continue the task in the new window after a model-initiated or forced rollover. */
 	let continueAfterRollover = false;
+	/** Post-fallback checkpoint fence: only one notes write/append may pass. */
+	let checkpointFenceActive = false;
+	let checkpointSaved = false;
+	let checkpointWriteClaimed = false;
 
 	function persist(): void {
 		if (sessionDir) saveState(sessionDir, state);
+	}
+
+	function requestRollover(): void {
+		state = { ...state, pendingNewContext: true };
+		rolloverRequested = true;
+		persist();
 	}
 
 	function currentBranch(ctx: ExtensionContext): LooseEntry[] {
@@ -298,10 +308,16 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		registerWindowTools(pi, {
 			config: bundle.defaults,
 			getState: () => state,
-			requestRollover: () => {
-				state = { ...state, pendingNewContext: true };
-				rolloverRequested = true;
-				persist();
+			requestRollover,
+			checkpointFenceActive: () => checkpointFenceActive && !checkpointSaved,
+			releaseCheckpointWrite: () => {
+				checkpointWriteClaimed = false;
+			},
+			completeCheckpoint: () => {
+				if (!checkpointFenceActive || checkpointSaved) return;
+				checkpointSaved = true;
+				checkpointWriteClaimed = true;
+				requestRollover();
 			},
 			getNotes: () => {
 				if (!notes) throw new Error("session not initialized yet");
@@ -333,6 +349,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		rolloverRequested = false;
 		compactionInFlight = false;
 		continueAfterRollover = false;
+		checkpointFenceActive = currentWindowHasMessage(branch, CUSTOM_TYPE_FALLBACK, state.currentWindowId, "fallback");
+		checkpointSaved = false;
+		checkpointWriteClaimed = false;
 		persist();
 
 		// First-window guidance (later windows bootstrap via the rollover summary).
@@ -359,7 +378,24 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	// ---------------------------------------------------------------------
 	pi.on("message_end", (event, ctx) => {
 		if (!bundle.defaults.enabled) return;
-		const msg = event.message as { role?: string; stopReason?: string; timestamp?: number };
+		const msg = event.message as {
+			role?: string;
+			stopReason?: string;
+			timestamp?: number;
+			customType?: string;
+			details?: { windowId?: string; kind?: string };
+		};
+		if (
+			msg?.role === "custom" &&
+			msg.customType === CUSTOM_TYPE_FALLBACK &&
+			(!msg.details?.windowId || msg.details.windowId === state.currentWindowId) &&
+			(!msg.details?.kind || msg.details.kind === "fallback")
+		) {
+			checkpointFenceActive = true;
+			checkpointSaved = false;
+			checkpointWriteClaimed = false;
+			return;
+		}
 		if (msg?.role !== "assistant" || msg.stopReason === "aborted") return;
 		// Skip messages from before the last rollover: their usage reflects the
 		// discarded window and must not re-trigger anything (mirrors pi's own
@@ -426,6 +462,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			"fallback",
 		);
 		if (fallbackInBranch) {
+			if (checkpointFenceActive && !checkpointSaved) return { cancel: true };
 			if (!state.fallbackActive || !state.fallbackDelivered) {
 				state = { ...state, reminderDelivered: true, fallbackDelivered: true, fallbackActive: true };
 				persist();
@@ -481,6 +518,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		pendingWindow = null;
 		rolloverRequested = false;
 		compactionInFlight = false;
+		checkpointFenceActive = false;
+		checkpointSaved = false;
+		checkpointWriteClaimed = false;
 		persist();
 		console.log(`pi-token-budget: context window reset ${previous} -> ${state.windowNumber} (id ${state.currentWindowId})`);
 	});
@@ -490,6 +530,10 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		pendingWindow = null;
 		compactionInFlight = false;
 		continueAfterRollover = false;
+		checkpointSaved = false;
+		checkpointWriteClaimed = false;
+		// Keep checkpointFenceActive armed: a failed rollover can be retried
+		// after rewriting the checkpoint if needed.
 		// aborted=true is expected: our one-shot threshold cancel.
 		// On a real rollover failure, fallbackActive stays set so the next
 		// threshold crossing retries the rollover.
@@ -529,7 +573,37 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			sendFallback(ctx);
 			return;
 		}
+		if (checkpointFenceActive && !checkpointSaved) return;
 		if (rolloverRequested || state.pendingNewContext) startDeferredRollover(ctx);
+	});
+
+	// Once the fallback has actually entered the branch, isolate the model at
+	// the checkpoint boundary. The in-flight response is left untouched; this
+	// hook only controls subsequent tool execution.
+	pi.on("tool_call", (event) => {
+		if (!checkpointFenceActive) return undefined;
+		const tool = event as unknown as { toolName?: string; input?: Record<string, unknown> };
+		const toolName = tool.toolName ?? "";
+		if (checkpointSaved && toolName === "new_context") return undefined;
+		if (checkpointSaved) {
+			return {
+				block: true,
+				terminate: true,
+				reason: "Checkpoint already saved; the context window rollover is pending.",
+			};
+		}
+		if (toolName === "notes") {
+			const operation = tool.input?.operation;
+			if ((operation === "write" || operation === "append") && checkpointWriteClaimed === false && checkpointSaved === false) {
+				checkpointWriteClaimed = true;
+				return undefined;
+			}
+		}
+		return {
+			block: true,
+			terminate: true,
+			reason: "Checkpoint required: only one notes.write or notes.append is allowed before the context window rolls over.",
+		};
 	});
 
 	pi.on("session_shutdown", () => {
@@ -537,5 +611,8 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		rolloverRequested = false;
 		compactionInFlight = false;
 		continueAfterRollover = false;
+		checkpointFenceActive = false;
+		checkpointSaved = false;
+		checkpointWriteClaimed = false;
 	});
 }

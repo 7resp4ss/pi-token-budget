@@ -259,6 +259,91 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	h.cleanup();
 }
 
+// Checkpoint fence: it arms only after fallback delivery, admits exactly one
+// notes write/append, blocks all other tools, and rolls over after success.
+{
+	const h = createHarness("checkpoint-fence");
+	h.setUsage(181_000, 200_000);
+	h.setIdle(false);
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+	assert.equal(h.steering.length, 1);
+	assert.equal(h.fire("tool_call", { type: "tool_call", toolCallId: "pre", toolName: "bash", input: { command: "echo pre" } }), undefined);
+	const fallback = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: fallback.customType, content: fallback.content, details: fallback.details },
+	});
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 0, "settled boundary must wait for the checkpoint");
+	h.setIdle(false);
+	assert.deepEqual(h.threshold(), { cancel: true }, "automatic compaction must wait for the checkpoint");
+
+	for (const toolName of ["bash", "read", "edit", "write", "subagent", "todo"]) {
+		const blocked = h.fire("tool_call", { type: "tool_call", toolCallId: `blocked-${toolName}`, toolName, input: {} }) as Record<string, unknown>;
+		assert.equal(blocked.block, true, `${toolName} must be blocked`);
+		assert.equal(blocked.terminate, true, `${toolName} must terminate the batch`);
+	}
+	for (const operation of ["read", "search", "list"]) {
+		const blocked = h.fire("tool_call", {
+			type: "tool_call",
+			toolCallId: `blocked-notes-${operation}`,
+			toolName: "notes",
+			input: { operation, path: "checkpoint.md" },
+		}) as Record<string, unknown>;
+		assert.equal(blocked.block, true);
+	}
+
+	const notesTool = h.tools.get("notes")!;
+	assert.equal(h.fire("tool_call", {
+		type: "tool_call",
+		toolCallId: "notes-write",
+		toolName: "notes",
+		input: { operation: "write", path: "checkpoint.md", text: "state" },
+	}), undefined);
+	const saved = await notesTool.execute("notes-write", { operation: "write", path: "checkpoint.md", text: "state" }, undefined, undefined, h.ctx) as Record<string, unknown>;
+	assert.equal(saved.terminate, true);
+	const secondWrite = h.fire("tool_call", {
+		type: "tool_call",
+		toolCallId: "second-write",
+		toolName: "notes",
+		input: { operation: "append", path: "checkpoint.md", text: "more" },
+	}) as Record<string, unknown>;
+	assert.equal(secondWrite.block, true);
+	assert.equal(secondWrite.terminate, true);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 1, "successful checkpoint must request rollover");
+	const compacted = h.threshold("manual", 181_000);
+	assert.ok(compacted.compaction);
+	h.commit(compacted.compaction!);
+	assert.equal(h.fire("tool_call", { type: "tool_call", toolCallId: "post", toolName: "bash", input: {} }), undefined);
+	h.cleanup();
+}
+
+// A failed checkpoint write releases its claim so a corrected write can retry.
+{
+	const h = createHarness("checkpoint-retry");
+	h.setUsage(181_000, 200_000);
+	h.setIdle(false);
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+	const fallback = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: fallback.customType, content: fallback.content, details: fallback.details },
+	});
+	const call = (id: string, operation: string, pathValue: string) => h.fire("tool_call", {
+		type: "tool_call", toolCallId: id, toolName: "notes", input: { operation, path: pathValue, text: "retry" },
+	});
+	assert.equal(call("bad", "write", "../invalid"), undefined);
+	const failed = await h.tools.get("notes")!.execute("bad", { operation: "write", path: "../invalid", text: "retry" }, undefined, undefined, h.ctx) as Record<string, unknown>;
+	assert.equal(failed.terminate, undefined);
+	assert.equal(call("good", "append", "checkpoint.md"), undefined);
+	const retried = await h.tools.get("notes")!.execute("good", { operation: "append", path: "checkpoint.md", text: "retry" }, undefined, undefined, h.ctx) as Record<string, unknown>;
+	assert.equal(retried.terminate, true);
+	h.cleanup();
+}
+
 // Bootstrap indexes keep the most recent entries: user requests (recency on
 // overflow + omission pointer) and edited files (dedupe by path, recency,
 // bounded, omission pointer).

@@ -84,14 +84,34 @@ export function registerNotesTool(pi: ToolRegistrar, deps: ToolDeps): void {
 					case "write": {
 						const p = requiredString(params.path, "path");
 						const text = requiredString(params.text, "text");
-						notes.writeFile(p, text);
-						return textResult(`Wrote ${Buffer.byteLength(text, "utf8")} bytes to ${p}.`, config);
+						try {
+							notes.writeFile(p, text);
+						} catch (err) {
+							if (deps.checkpointFenceActive()) deps.releaseCheckpointWrite();
+							throw err;
+						}
+						const result = textResult(`Wrote ${Buffer.byteLength(text, "utf8")} bytes to ${p}.`, config);
+						if (deps.checkpointFenceActive()) {
+							deps.completeCheckpoint();
+							return { ...result, terminate: true };
+						}
+						return result;
 					}
 					case "append": {
 						const p = requiredString(params.path, "path");
 						const text = requiredString(params.text, "text");
-						notes.appendToFile(p, text);
-						return textResult(`Appended ${Buffer.byteLength(text, "utf8")} bytes to ${p}.`, config);
+						try {
+							notes.appendToFile(p, text);
+						} catch (err) {
+							if (deps.checkpointFenceActive()) deps.releaseCheckpointWrite();
+							throw err;
+						}
+						const result = textResult(`Appended ${Buffer.byteLength(text, "utf8")} bytes to ${p}.`, config);
+						if (deps.checkpointFenceActive()) {
+							deps.completeCheckpoint();
+							return { ...result, terminate: true };
+						}
+						return result;
 					}
 					case "read": {
 						const p = requiredString(params.path, "path");
@@ -131,6 +151,7 @@ export function registerNotesTool(pi: ToolRegistrar, deps: ToolDeps): void {
 						return textResult(`Unknown operation "${String(op)}".`, config);
 				}
 			} catch (err) {
+				if (deps.checkpointFenceActive()) deps.releaseCheckpointWrite();
 				return textResult(`notes ${op} failed: ${err instanceof Error ? err.message : String(err)}`, config);
 			}
 		},

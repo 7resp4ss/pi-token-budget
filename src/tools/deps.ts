@@ -24,6 +24,12 @@ export interface ToolDeps {
 	getState(): WindowState;
 	/** Set the pending rollover request and persist state. */
 	requestRollover(): void;
+	/** Whether the post-fallback checkpoint fence is currently active. */
+	checkpointFenceActive(): boolean;
+	/** Release a failed checkpoint write so the model can retry it. */
+	releaseCheckpointWrite(): void;
+	/** Mark the checkpoint complete and request the deferred rollover. */
+	completeCheckpoint(): void;
 	/** Notes store for the active session. */
 	getNotes(): NotesStore;
 	/** History index built from the live session branch. */
