@@ -28,13 +28,13 @@ const bundle: ConfigBundle = {
 		"openai/gpt-5.6-codex": { hardRolloverUsedTokens: 256_000 },
 		"anthropic/*": { hardRolloverUsedTokens: 160_000, reminderRemainingPercent: 0.3 },
 		anthropic: { hardRolloverUsedTokens: 120_000 },
-		"*": { maxToolOutputChars: 8000 },
+	"*": { maxToolOutputChars: 8000 }, // global-only field is ignored for model resolution
 	},
 };
 assert.equal(resolveForModel(bundle, "openai", "gpt-5.6-codex").hardRolloverUsedTokens, 256_000); // exact wins
 assert.equal(resolveForModel(bundle, "anthropic", "claude-opus-4").hardRolloverUsedTokens, 160_000); // provider/* beats bare provider
 assert.equal(resolveForModel(bundle, "anthropic", "claude-opus-4").reminderRemainingPercent, 0.3);
-assert.equal(resolveForModel(bundle, "google", "gemini-2.5-pro").maxToolOutputChars, 8000); // * fallback
+assert.equal(resolveForModel(bundle, "google", "gemini-2.5-pro").maxToolOutputChars, DEFAULTS.maxToolOutputChars); // global-only field stays global
 assert.equal(resolveForModel(bundle, "google", "gemini-2.5-pro").hardRolloverUsedTokens, 0); // untouched keys inherit defaults
 assert.deepEqual(resolveForModel(bundle, undefined, undefined), bundle.defaults); // no model: defaults
 
@@ -66,6 +66,19 @@ assert.equal(st2.windowNumber, 3);
 assert.equal(st2.currentWindowId, "w3");
 assert.equal(st2.previousWindowId, "w2");
 assert.equal(st2.reminderDelivered, true, "conservative after inference");
+
+// Environment overrides are global and win over model-specific trigger values.
+const previousPercent = process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT;
+const previousHard = process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS;
+process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT = "0.2";
+process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "999";
+const envResolved = resolveForModel(bundle, "anthropic", "claude-opus-4");
+assert.equal(envResolved.reminderRemainingPercent, 0.2);
+assert.equal(envResolved.hardRolloverUsedTokens, 999);
+if (previousPercent === undefined) delete process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT;
+else process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT = previousPercent;
+if (previousHard === undefined) delete process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS;
+else process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = previousHard;
 
 // --- prompts ----------------------------------------------------------------
 const boot = bootstrapText({ firstWindowId: "w-a", previousWindowId: "w-b", currentWindowId: "w-c", windowNumber: 3 });
@@ -106,6 +119,15 @@ const notes = new NotesStore(dir, "notes-session-a", 1_000_000);
 notes.writeFile("checkpoint.md", "goal: ship the plugin\n");
 notes.appendToFile("checkpoint.md", "progress: smoke test\n");
 assert.equal(notes.readFile("checkpoint.md").content, "goal: ship the plugin\nprogress: smoke test\n");
+
+// max_files limits matching files, not the number of matching lines.
+const notesLimit = new NotesStore(dir, "notes-search-limit", 1_000_000);
+notesLimit.writeFile("many-matches.md", "smoke\nsmoke\nsmoke\n");
+notesLimit.writeFile("second-match.md", "smoke\n");
+assert.deepEqual(
+	notesLimit.searchContents("smoke", undefined, 2, 10).map((match) => match.path),
+	["many-matches.md", "many-matches.md", "many-matches.md", "second-match.md"],
+);
 assert.equal(notes.readFile("checkpoint.md", 2, 2).content, "progress: smoke test");
 assert.deepEqual(notes.searchContents("smoke").map((m) => m.path), ["checkpoint.md"]);
 assert.deepEqual(notes.listFiles().map((f) => f.path), ["checkpoint.md"]);

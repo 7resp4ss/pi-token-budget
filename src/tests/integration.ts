@@ -41,7 +41,7 @@ interface CompactResult {
 	compaction?: { summary: string; firstKeptEntryId: string; tokensBefore: number };
 }
 
-function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}`) {
+function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}`, initialBranch: unknown[] = []) {
 	const handlers = new Map<string, Handler>();
 	const tools = new Map<
 		string,
@@ -59,7 +59,7 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 	const steering: CustomMessage[] = [];
 	const followUps: CustomMessage[] = [];
 	const triggeredTurns: CustomMessage[] = [];
-	let branch: unknown[] = [];
+	let branch: unknown[] = initialBranch;
 	let entryCounter = 0;
 	let idle = true;
 	let compactCalls = 0;

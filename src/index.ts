@@ -86,7 +86,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	let modelConfig: TokenBudgetConfig = bundle.defaults;
 	function effectiveConfig(ctx: ExtensionContext): TokenBudgetConfig {
 		const model = ctx.model;
-		if (!model) return bundle.defaults;
+		if (!model) return resolveForModel(bundle, undefined, undefined);
 		const key = `${model.provider}/${model.id}`;
 		if (key !== modelConfigKey) {
 			modelConfigKey = key;
@@ -340,6 +340,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		if (!bundle.defaults.enabled) return;
 		sessionDir = ctx.sessionManager.getSessionDir();
+		lastRolloverTimestamp = 0;
+		modelConfigKey = "";
+		modelConfig = bundle.defaults;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const branch = currentBranch(ctx);
 		const loaded = loadState(sessionDir, sessionId);

@@ -10,7 +10,7 @@
  * Flat (applies to every model):
  *   { "tokenBudget": { "reminderRemainingPercent": 0.25, ... } }
  *
- * Per-model overrides (glob patterns over "provider/model-id"):
+ * Per-model rollover-trigger overrides (glob patterns over "provider/model-id"):
  *   {
  *     "tokenBudget": {
  *       "defaults": { "reminderRemainingPercent": 0.25 },
@@ -77,6 +77,13 @@ export interface ConfigBundle {
 	models: Record<string, Partial<TokenBudgetConfig>>;
 }
 
+const MODEL_OVERRIDE_KEYS = new Set<string>([
+	"reminderRemainingPercent",
+	"reminderRemainingFloorTokens",
+	"reminderRemainingCeilingTokens",
+	"hardRolloverUsedTokens",
+]);
+
 function agentSettingsPath(): string {
 	const agentDir = process.env.PI_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 	return path.join(agentDir, "settings.json");
@@ -100,13 +107,19 @@ const NUMBER_KEYS = [
 	"historyItemPreviewChars",
 ] as const;
 
-function applySection(base: TokenBudgetConfig, section: unknown): TokenBudgetConfig {
+function applySection(
+	base: TokenBudgetConfig,
+	section: unknown,
+	allowedKeys = new Set<string>(NUMBER_KEYS),
+	allowEnabled = true,
+): TokenBudgetConfig {
 	if (!section || typeof section !== "object") return base;
 	const s = section as Record<string, unknown>;
 	const next = { ...base };
 	const enabled = coerceBoolean(s.enabled);
-	if (enabled !== undefined) next.enabled = enabled;
+	if (allowEnabled && enabled !== undefined) next.enabled = enabled;
 	for (const key of NUMBER_KEYS) {
+		if (!allowedKeys.has(key)) continue;
 		const n = coerceNumber(s[key]);
 		if (n !== undefined && n >= 0) next[key] = n;
 	}
@@ -149,14 +162,31 @@ function patternScore(pattern: string, provider: string, modelId: string): numbe
 
 /** Resolve the effective config for the active provider/model. */
 export function resolveForModel(bundle: ConfigBundle, provider: string | undefined, modelId: string | undefined): TokenBudgetConfig {
-	if (!provider || !modelId) return bundle.defaults;
-	let best: { score: number; section: Partial<TokenBudgetConfig> } | null = null;
-	for (const [pattern, section] of Object.entries(bundle.models)) {
-		const score = patternScore(pattern, provider, modelId);
-		if (score >= 0 && (!best || score > best.score)) best = { score, section };
+	let resolved = bundle.defaults;
+	if (provider && modelId) {
+		let best: { score: number; section: Partial<TokenBudgetConfig> } | null = null;
+		for (const [pattern, section] of Object.entries(bundle.models)) {
+			const score = patternScore(pattern, provider, modelId);
+			if (score >= 0 && (!best || score > best.score)) best = { score, section };
+		}
+		if (best) {
+			// Model overrides intentionally cover trigger thresholds only. Tool
+			// output and notes capacity remain session-global.
+			resolved = applySection(resolved, best.section, MODEL_OVERRIDE_KEYS, false);
+		}
 	}
-	if (!best) return bundle.defaults;
-	return applySection(bundle.defaults, best.section);
+	return applyEnvironmentOverrides(resolved);
+}
+
+function applyEnvironmentOverrides(config: TokenBudgetConfig): TokenBudgetConfig {
+	let next = { ...config };
+	const envPercent = coerceNumber(Number(process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT));
+	if (envPercent !== undefined && envPercent > 0 && envPercent < 1) {
+		next.reminderRemainingPercent = envPercent;
+	}
+	const envHard = coerceNumber(Number(process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS));
+	if (envHard !== undefined && envHard > 0) next.hardRolloverUsedTokens = envHard;
+	return next;
 }
 
 export function loadConfig(): ConfigBundle {
@@ -172,7 +202,17 @@ export function loadConfig(): ConfigBundle {
 				defaults = applySection(defaults, s.defaults);
 				if (s.models && typeof s.models === "object") {
 					for (const [pattern, override] of Object.entries(s.models as Record<string, unknown>)) {
-						if (override && typeof override === "object") models[pattern] = override as Partial<TokenBudgetConfig>;
+						if (override && typeof override === "object") {
+							const unsupported = Object.keys(override as Record<string, unknown>).filter(
+								(key) => (key === "enabled" || NUMBER_KEYS.includes(key as (typeof NUMBER_KEYS)[number])) && !MODEL_OVERRIDE_KEYS.has(key),
+							);
+							if (unsupported.length > 0) {
+								console.warn(
+									`pi-token-budget: model config "${pattern}" ignores global-only fields: ${unsupported.join(", ")}`,
+								);
+							}
+							models[pattern] = override as Partial<TokenBudgetConfig>;
+						}
 					}
 				}
 			} else {
@@ -185,11 +225,5 @@ export function loadConfig(): ConfigBundle {
 	}
 
 	if (process.env.PI_TOKEN_BUDGET_DISABLED === "1") defaults.enabled = false;
-	const envPercent = coerceNumber(Number(process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT));
-	if (envPercent !== undefined && envPercent > 0 && envPercent < 1) {
-		defaults.reminderRemainingPercent = envPercent;
-	}
-	const envHard = coerceNumber(Number(process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS));
-	if (envHard !== undefined && envHard > 0) defaults.hardRolloverUsedTokens = envHard;
 	return { defaults, models };
 }

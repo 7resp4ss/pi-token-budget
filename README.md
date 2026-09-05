@@ -133,11 +133,11 @@ Reads the `tokenBudget` key from `~/.pi/agent/settings.json` (or `$PI_AGENT_DIR/
 |---|---|
 | `reminderRemainingPercent/Floor/Ceiling` | Remaining threshold for the one-shot reminder: `max(min(percent × window, ceiling), floor)`, clamped to 50% of the window |
 | `hardRolloverUsedTokens` | **Absolute hard trigger**: when used tokens ≥ this value, force a no-summary rollover at the next turn boundary (with a 90% hysteresis gate against flapping); e.g. setting 256000 for a 400k window means "start a new window at 256k by default" |
-| `maxToolOutputChars` / `notesMaxFileBytes` / `historyItemPreviewChars` | Output truncation and capacity limits; notes bloat soft-warning thresholds derive from `notesMaxFileBytes` (single file cap/16, total cap/4) — no separate configuration |
+| `maxToolOutputChars` / `notesMaxFileBytes` / `historyItemPreviewChars` | Global output truncation and capacity limits; notes bloat soft-warning thresholds derive from `notesMaxFileBytes` (single file cap/16, total cap/4) — these fields are not model-specific |
 
-Pattern-matching precedence: exact `provider/model-id` > wildcards like `provider/*` > bare `provider` > `*` (case-insensitive; `*` is the only wildcard).
+Pattern-matching precedence: exact `provider/model-id` > wildcards like `provider/*` > bare `provider` > `*` (case-insensitive; `*` is the only wildcard). Model overrides apply to rollover trigger fields only (`reminderRemainingPercent`, `reminderRemainingFloorTokens`, `reminderRemainingCeilingTokens`, `hardRolloverUsedTokens`).
 
-Environment variables: `PI_TOKEN_BUDGET_DISABLED=1` disables the extension; `PI_TOKEN_BUDGET_REMINDER_PERCENT=0.3` overrides the reminder ratio; `PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS=256000` overrides the hard trigger.
+Environment variables: `PI_TOKEN_BUDGET_DISABLED=1` disables the extension; `PI_TOKEN_BUDGET_REMINDER_PERCENT=0.3` and `PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS=256000` are global overrides and take precedence over model-specific settings.
 
 ## Subagent compatibility (pi-subagents)
 
@@ -159,7 +159,7 @@ If you'd rather keep this extension out of subagents, declare `extensions: []` i
 
 - Models with very small contexts (<16k) hit the fallback path frequently — degraded experience, still correct
 - If the session is too short after `new_context` and pi reports "Nothing to compact"/"Already compacted", the rollover request is safely discarded
-- After upgrading from 0.2.x, old shared notes do not automatically appear in new sessions (expected behavior of strict isolation; migrate manually if needed)
+- Notes are strictly isolated by `sessionId` and are never shared automatically between separate sessions. To reuse a checkpoint in another session, migrate the note content explicitly; this package does not merge cross-session notes.
 
 ## Development
 

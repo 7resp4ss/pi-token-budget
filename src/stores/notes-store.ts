@@ -152,8 +152,9 @@ export class NotesStore {
 	searchContents(query: string, prefix?: string, maxFiles?: number, maxMatchesPerFile?: number): Array<{ path: string; line: number; text: string }> {
 		const results: Array<{ path: string; line: number; text: string }> = [];
 		const files = this.listFiles(prefix).filter((f) => f.bytes <= this.maxFileBytes);
+		let matchedFileCount = 0;
 		for (const f of files) {
-			if (maxFiles && results.length >= maxFiles) break;
+			if (maxFiles && matchedFileCount >= maxFiles) break;
 			let perFile = 0;
 			const text = fs.readFileSync(path.join(this.root, f.path), "utf8");
 			const lines = text.split("\n");
@@ -164,6 +165,7 @@ export class NotesStore {
 					perFile++;
 				}
 			}
+			if (perFile > 0) matchedFileCount++;
 		}
 		return results;
 	}
