@@ -1,6 +1,26 @@
 # pi-token-budget
 
-Token-budget context window management for [pi](https://github.com/earendil-works/pi): **no-summary window rollover** with model-authored notes checkpoints and read-only history recovery. Replaces pi's summarization compaction with the mechanism pioneered by codex's `token_budget` feature (#27488 series).
+[![npm version](https://img.shields.io/npm/v/pi-token-budget?style=flat-square)](https://www.npmjs.com/package/pi-token-budget) [![license](https://img.shields.io/npm/l/pi-token-budget?style=flat-square)](LICENSE)
+
+Token-budget context window management for [Pi](https://github.com/earendil-works/pi): **no-summary context rollover** with model-authored notes checkpoints, read-only history recovery, and a post-fallback tool-call fence. It replaces lossy summarization compaction while preserving the current in-flight response.
+
+## At a glance
+
+Long-running Pi sessions can hit a nearly exhausted context window while the model is still trying to work. A fallback prompt alone is not enough: the model may continue issuing `bash`, `read`, or `write` calls for many minutes before the window finally rolls over.
+
+`pi-token-budget` turns that boundary into an enforceable checkpoint:
+
+- the fallback is delivered without aborting the current response;
+- once delivered, only one `notes` write/append is admitted;
+- all other tools are blocked at the `tool_call` hook;
+- a successful checkpoint returns `terminate: true` and requests rollover automatically;
+- the next window starts with a fresh bootstrap and recovers the task through notes and history.
+
+Install it with:
+
+```bash
+pi install npm:pi-token-budget
+```
 
 ## Why
 
@@ -33,6 +53,18 @@ New window = bootstrap block (window identity + recovery protocol
      re-read on demand via history by item id
 ```
 
+After the fallback reaches the branch, the checkpoint fence closes the tool surface until the checkpoint is saved:
+
+```text
+fallback delivered ──► notes.write / notes.append (exactly once)
+                  └──► other tool calls blocked
+checkpoint saved ──► terminate tool batch ──► deferred rollover
+```
+
+### Why this exists
+
+In a forensic review of a real Pi session, fallback delivery was followed by approximately 64 tool calls and 15 minutes of delay in one window, then approximately 101 tool calls and 57 minutes of delay in the next. The fence addresses that specific failure mode without interrupting the response that was already in flight.
+
 Rollover carries zero summary: the new window keeps none of the old conversation. The model's big-picture memory comes from notes checkpoints it wrote itself, and details can always be pulled back from the read-only history index — old session content is never lost, it just no longer occupies the context.
 
 ## Tools (model-only)
@@ -56,7 +88,7 @@ Alternatives:
 
 ```bash
 # git (pinnable version)
-pi install git:github.com/7resp4ss/pi-token-budget@v1.0.0
+pi install git:github.com/7resp4ss/pi-token-budget@v1.1.3
 
 # Try without installing
 pi -e npm:pi-token-budget
@@ -66,6 +98,14 @@ ln -s /path/to/pi-token-budget/src/index.ts ~/.pi/agent/extensions/pi-token-budg
 ```
 
 No build step: pi's extension loader (jiti) executes TypeScript directly.
+
+## Compatibility and safety
+
+- Requires a Pi installation that supports Pi Packages and extension `tool_call` hooks.
+- Tested against `@earendil-works/pi-coding-agent` / `pi-agent-core` `0.84.4`; newer Pi releases should be checked against the integration contract before production rollout.
+- The extension does not collect telemetry or make network requests.
+- Notes are stored per session under the session directory; window state and checkpoints are isolated by session id.
+- Pi extensions run with the host process's permissions. Review the source before installing any extension, including this one.
 
 ## Configuration
 
