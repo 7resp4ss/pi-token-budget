@@ -9,6 +9,7 @@
 		"pi-extension",
 		"pi",
 		"coding-agent",
+		"context",
 		"context-window",
 		"context-management",
 		"token-budget",
