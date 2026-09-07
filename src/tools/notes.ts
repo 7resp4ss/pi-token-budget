@@ -10,6 +10,7 @@
  * Operations:
  *   write   — create or replace a note file
  *   append  — add to the end of a note file (checkpoint accumulation)
+ *   delete  — remove one note file explicitly
  *   read    — full file, 1-based line range (negative = from the end),
  *             and/or a char window (offset_chars/limit_chars) so content
  *             beyond a very long single line stays reachable
@@ -17,7 +18,7 @@
  *   list    — files under an optional path prefix (+ soft bloat warnings)
  *
  * Constraints enforced by the store: virtual paths only (no traversal),
- * 1MB per file, reads reflect writes immediately.
+ * configured per-file cap, reads reflect writes immediately.
  */
 
 import { Type } from "typebox";
@@ -31,12 +32,13 @@ const NOTES_PARAMS = Type.Object({
 			Type.Literal("read"),
 			Type.Literal("write"),
 			Type.Literal("append"),
+			Type.Literal("delete"),
 			Type.Literal("search"),
 			Type.Literal("list"),
 		],
 		{ description: "Which notes operation to run." },
 	),
-	path: Type.Optional(Type.String({ description: "Virtual note path, e.g. \"checkpoint.md\". Required for read/write/append." })),
+	path: Type.Optional(Type.String({ description: "Virtual note path, e.g. \"checkpoint.md\". Required for read/write/append/delete." })),
 	text: Type.Optional(Type.String({ description: "Content for write/append. 'write' replaces the whole file; 'append' adds to the end." })),
 	query: Type.Optional(Type.String({ description: "Literal substring for search." })),
 	prefix: Type.Optional(Type.String({ description: "Path prefix for list/search." })),
@@ -66,7 +68,7 @@ export function registerNotesTool(pi: ToolRegistrar, deps: ToolDeps): void {
 		name: "notes",
 		label: "Notes",
 		description:
-			'Read and maintain private notes that survive context-window resets within this session. Paths are virtual, not filesystem paths (e.g. "checkpoint.md"). Reads reflect writes immediately; page long files by lines (start_line/stop_line) or by chars (offset_chars/limit_chars). Files must stay at or below 1,000,000 bytes; create another file before approaching the limit. ' +
+			`Read and maintain private notes that survive context-window resets within this session. Paths are virtual, not filesystem paths (e.g. "checkpoint.md"). Reads reflect writes immediately; page long files by lines (start_line/stop_line) or by chars (offset_chars/limit_chars). Files must stay at or below ${config.notesMaxFileBytes} bytes; create another file before approaching the limit. Use delete to remove an obsolete file. ` +
 			TOOL_PRIVATE_USAGE_HINT,
 		promptSnippet: "Persistent private notes across context windows (notes).",
 		parameters: NOTES_PARAMS,
@@ -112,6 +114,11 @@ export function registerNotesTool(pi: ToolRegistrar, deps: ToolDeps): void {
 							return { ...result, terminate: true };
 						}
 						return result;
+					}
+					case "delete": {
+						const p = requiredString(params.path, "path");
+						notes.deleteFile(p);
+						return textResult(`Deleted ${p}.`, config);
 					}
 					case "read": {
 						const p = requiredString(params.path, "path");

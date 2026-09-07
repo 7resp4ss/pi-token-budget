@@ -88,7 +88,7 @@ Alternatives:
 
 ```bash
 # git (pinnable version)
-pi install git:github.com/7resp4ss/pi-token-budget@v1.1.4
+pi install git:github.com/7resp4ss/pi-token-budget@v1.1.5
 
 # Try without installing
 pi -e npm:pi-token-budget
@@ -102,7 +102,7 @@ No build step: pi's extension loader (jiti) executes TypeScript directly.
 ## Compatibility and safety
 
 - Requires a Pi installation that supports Pi Packages and extension `tool_call` hooks.
-- Tested against `@earendil-works/pi-coding-agent` / `pi-agent-core` `0.84.4`; newer Pi releases should be checked against the integration contract before production rollout.
+- Pinned development tests use `@earendil-works/pi-coding-agent` / `pi-agent-core` `0.84.4`; CI also checks the latest stable Pi packages for API drift before production rollout.
 - The extension does not collect telemetry or make network requests.
 - Notes are stored per session under the session directory; window state and checkpoints are isolated by session id.
 - Pi extensions run with the host process's permissions. Review the source before installing any extension, including this one.
@@ -131,9 +131,9 @@ Reads the `tokenBudget` key from `~/.pi/agent/settings.json` (or `$PI_AGENT_DIR/
 
 | Field | Meaning |
 |---|---|
-| `reminderRemainingPercent/Floor/Ceiling` | Remaining threshold for the one-shot reminder: `max(min(percent × window, ceiling), floor)`, clamped to 50% of the window |
+| `reminderRemainingPercent/Floor/Ceiling` | Remaining threshold for the one-shot reminder: `max(min(percent × window, ceiling), floor)`, clamped to 50% of the window; percent must be strictly between 0 and 1 |
 | `hardRolloverUsedTokens` | **Absolute hard trigger**: when used tokens ≥ this value, force a no-summary rollover at the next turn boundary (with a 90% hysteresis gate against flapping); e.g. setting 256000 for a 400k window means "start a new window at 256k by default" |
-| `maxToolOutputChars` / `notesMaxFileBytes` / `historyItemPreviewChars` | Global output truncation and capacity limits; notes bloat soft-warning thresholds derive from `notesMaxFileBytes` (single file cap/16, total cap/4) — these fields are not model-specific |
+| `maxToolOutputChars` / `notesMaxFileBytes` / `historyItemPreviewChars` | Global output truncation and capacity limits; values must be at least 1; notes bloat soft-warning thresholds derive from `notesMaxFileBytes` (single file cap/16, total cap/4) — these fields are not model-specific |
 
 Pattern-matching precedence: exact `provider/model-id` > wildcards like `provider/*` > bare `provider` > `*` (case-insensitive; `*` is the only wildcard). Model overrides apply to rollover trigger fields only (`reminderRemainingPercent`, `reminderRemainingFloorTokens`, `reminderRemainingCeilingTokens`, `hardRolloverUsedTokens`).
 
@@ -160,6 +160,7 @@ If you'd rather keep this extension out of subagents, declare `extensions: []` i
 - Models with very small contexts (<16k) hit the fallback path frequently — degraded experience, still correct
 - If the session is too short after `new_context` and pi reports "Nothing to compact"/"Already compacted", the rollover request is safely discarded
 - Notes are strictly isolated by `sessionId` and are never shared automatically between separate sessions. To reuse a checkpoint in another session, migrate the note content explicitly; this package does not merge cross-session notes.
+- Branch navigation events (`session_before_tree`, `session_tree`, and `session_before_fork`) are not interpreted as branch-aware window-state migrations. Returning to an older branch can make persisted window ids differ from that branch's history; full branch-aware state handling is deferred.
 
 ## Development
 

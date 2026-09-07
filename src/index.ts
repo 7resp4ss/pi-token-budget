@@ -267,8 +267,10 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		for (let i = 0; i < branch.length; i++) {
 			if (branch[i].type === "compaction") lastCompaction = i;
 		}
-		if (lastCompaction >= 0 && typeof branch[lastCompaction].summary === "string") {
-			// Rollover bootstraps carry guidance themselves.
+		const compaction = lastCompaction >= 0 ? branch[lastCompaction] : undefined;
+		if (compaction && typeof compaction.summary === "string" && compaction.summary.includes(BOOTSTRAP_MARKER)) {
+			// Only rollover bootstraps carry this plugin's guidance. Pi-native
+			// summaries must still receive the first-window guidance message.
 			return true;
 		}
 		for (let i = lastCompaction + 1; i < branch.length; i++) {

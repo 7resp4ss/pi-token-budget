@@ -7,12 +7,12 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DEFAULTS, reminderThreshold, resolveForModel, type ConfigBundle } from "../config.ts";
+import { DEFAULTS, loadConfig, reminderThreshold, resolveForModel, type ConfigBundle } from "../config.ts";
 import { HistoryStore } from "../stores/history-store.ts";
 import { NotesStore } from "../stores/notes-store.ts";
 import { BOOTSTRAP_MARKER, bootstrapText, guidanceMessage, reminderMessage } from "../prompts.ts";
 import { notesBloatWarnings } from "../tools/deps.ts";
-import { commitRollover, freshState, inferFromBranch, loadState, saveState } from "../state.ts";
+import { commitRollover, freshState, inferFromBranch, loadState, saveState, stateFilePath } from "../state.ts";
 
 // --- config thresholds ---------------------------------------------------
 assert.equal(reminderThreshold(DEFAULTS, 200_000), 50_000); // 25% of window
@@ -45,14 +45,32 @@ assert.equal(st.windowNumber, 1);
 assert.equal(st.previousWindowId, null);
 assert.equal(st.currentWindowId, "w1", "window id is the ordinal");
 st = { ...st, pendingNewContext: true, reminderDelivered: true, fallbackDelivered: true, fallbackActive: true };
-st = commitRollover(st, { id: "w-next01", number: 2 });
+st = commitRollover(st, { id: "w2", number: 2 });
 assert.equal(st.windowNumber, 2);
-assert.equal(st.currentWindowId, "w-next01");
+assert.equal(st.currentWindowId, "w2");
 assert.equal(st.reminderDelivered, false, "one-shot flags reset per window");
 assert.equal(st.pendingNewContext, false);
 assert.equal(st.fallbackActive, false);
 saveState(dir, st);
-assert.deepEqual(loadState(dir, "s1").currentWindowId, "w-next01");
+assert.deepEqual(loadState(dir, "s1").currentWindowId, "w2");
+
+// Invalid persisted state is rejected so branch inference can rebuild it.
+fs.writeFileSync(
+	stateFilePath(dir, "s1"),
+	JSON.stringify({ ...st, currentWindowId: "w3", windowNumber: 2 }),
+	"utf8",
+);
+assert.equal(loadState(dir, "s1").currentWindowId, "w1");
+const recovered = inferFromBranch(loadState(dir, "s1"), [
+	{ type: "compaction", summary: `rollover ${BOOTSTRAP_MARKER}` },
+]);
+assert.equal(recovered.currentWindowId, "w2");
+fs.writeFileSync(
+	stateFilePath(dir, "s1"),
+	JSON.stringify({ ...freshState("s1"), reminderDelivered: "yes" }),
+	"utf8",
+);
+assert.equal(loadState(dir, "s1").currentWindowId, "w1");
 
 // inference after state loss
 const st2 = inferFromBranch(freshState("s1"), [
@@ -79,6 +97,60 @@ if (previousPercent === undefined) delete process.env.PI_TOKEN_BUDGET_REMINDER_P
 else process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT = previousPercent;
 if (previousHard === undefined) delete process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS;
 else process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = previousHard;
+
+const previousInvalidPercent = process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT;
+const previousInvalidAgentDir = process.env.PI_AGENT_DIR;
+const invalidEnvAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-token-budget-env-config-"));
+process.env.PI_AGENT_DIR = invalidEnvAgentDir;
+process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT = "1.2";
+let invalidEnvWarningCount = 0;
+const warnBeforeInvalidEnv = console.warn;
+console.warn = () => {
+	invalidEnvWarningCount++;
+};
+const invalidEnvConfig = loadConfig();
+console.warn = warnBeforeInvalidEnv;
+assert.equal(invalidEnvConfig.defaults.reminderRemainingPercent, DEFAULTS.reminderRemainingPercent);
+assert.equal(invalidEnvWarningCount, 1);
+if (previousInvalidPercent === undefined) delete process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT;
+else process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT = previousInvalidPercent;
+if (previousInvalidAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+else process.env.PI_AGENT_DIR = previousInvalidAgentDir;
+fs.rmSync(invalidEnvAgentDir, { recursive: true, force: true });
+
+// Settings use the same bounds as environment overrides and warn once.
+const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-token-budget-config-"));
+const previousAgentDir = process.env.PI_AGENT_DIR;
+process.env.PI_AGENT_DIR = configDir;
+fs.writeFileSync(
+	path.join(configDir, "settings.json"),
+	JSON.stringify({
+		tokenBudget: {
+			defaults: {
+				reminderRemainingPercent: 1,
+				maxToolOutputChars: 0,
+				notesMaxFileBytes: 0,
+				historyItemPreviewChars: 0,
+			},
+		},
+	}),
+	"utf8",
+);
+const originalWarn = console.warn;
+let configWarningCount = 0;
+console.warn = () => {
+	configWarningCount++;
+};
+const invalidConfig = loadConfig();
+console.warn = originalWarn;
+assert.equal(invalidConfig.defaults.reminderRemainingPercent, DEFAULTS.reminderRemainingPercent);
+assert.equal(invalidConfig.defaults.maxToolOutputChars, DEFAULTS.maxToolOutputChars);
+assert.equal(invalidConfig.defaults.notesMaxFileBytes, DEFAULTS.notesMaxFileBytes);
+assert.equal(invalidConfig.defaults.historyItemPreviewChars, DEFAULTS.historyItemPreviewChars);
+assert.equal(configWarningCount, 1);
+if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+else process.env.PI_AGENT_DIR = previousAgentDir;
+fs.rmSync(configDir, { recursive: true, force: true });
 
 // --- prompts ----------------------------------------------------------------
 const boot = bootstrapText({ firstWindowId: "w-a", previousWindowId: "w-b", currentWindowId: "w-c", windowNumber: 3 });
@@ -204,6 +276,25 @@ for (let i = 0; i < 6; i++) sprawl.writeFile(`part${i}.md`, "z".repeat(50_000));
 warns = notesBloatWarnings(() => sprawl, DEFAULTS);
 assert.equal(warns.length, 1);
 assert.ok(warns[0].includes("total notes size") && warns[0].includes("300000"), warns[0]);
+
+// Bloat statistics must inspect all files, not only the first 500 alphabetically.
+const beyondListLimit = new NotesStore(dir, "notes-session-501", 1_000_000);
+for (let i = 0; i < 500; i++) beyondListLimit.writeFile(`note-${i.toString().padStart(3, "0")}.md`, "x".repeat(500));
+beyondListLimit.writeFile("z-oversized.md", "y".repeat(70_000));
+warns = notesBloatWarnings(() => beyondListLimit, DEFAULTS);
+assert.equal(warns.length, 2);
+assert.ok(warns.some((warning) => warning.includes('"z-oversized.md"')), warns.join("\n"));
+assert.ok(warns.some((warning) => warning.includes("501 files") && warning.includes("320000")), warns.join("\n"));
+
+// Delete is explicit, path-safe, and only applies to regular note files.
+const deletions = new NotesStore(dir, "notes-session-delete", 1_000_000);
+deletions.writeFile("checkpoint.md", "checkpoint");
+deletions.writeFile("nested/child.md", "child");
+deletions.deleteFile("checkpoint.md");
+assert.deepEqual(deletions.listFiles().map((file) => file.path), ["nested/child.md"]);
+assert.throws(() => deletions.deleteFile("checkpoint.md"), /no note file/);
+assert.throws(() => deletions.deleteFile("nested"), /no note file/);
+assert.throws(() => deletions.deleteFile("../outside"), /unsupported path component/);
 assert.deepEqual(
 	notesBloatWarnings(() => {
 		throw new Error("session not initialized yet");

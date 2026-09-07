@@ -34,11 +34,12 @@
 |---|---|---|
 | `write` | `path`, `text` | 创建/整文件替换 |
 | `append` | `path`, `text` | 追加（检查点累积）；撞顶报错含剩余配额与可清理文件提示 |
+| `delete` | `path` | 显式删除一个普通 note 文件；不会自动清理或完成 checkpoint fence |
 | `read` | `path`, `start_line?`, `stop_line?`, `offset_chars?`, `limit_chars?` | 全文、行区间（负数=从尾部数）或字符窗口（与 history `read_item` 对齐，可越过超长单行）；limit 钉到输出上限，头部位置永远诚实 |
 | `search` | `query`, `prefix?`, `max_files?`, `max_matches_per_file?` | 字面量子串 |
 | `list` | `prefix?`, `max_results?` | 路径前缀列表；超派生阈值时附加膨胀软警告行 |
 
-约束（store 层强制）：虚拟路径不可逃逸、单文件 ≤1MB、读立即可见写。
+约束（store 层强制）：虚拟路径不可逃逸、单文件不超过生效配置上限、读立即可见写；删除只接受普通文件路径。
 
 ## history
 

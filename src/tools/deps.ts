@@ -67,24 +67,23 @@ export function clampInt(value: unknown, min: number, max: number, fallback: num
  */
 export function notesBloatWarnings(getNotes: () => NotesStore, config: TokenBudgetConfig): string[] {
 	const lines: string[] = [];
-	let files: Array<{ path: string; bytes: number }>;
+	let stats: ReturnType<NotesStore["measureStats"]>;
 	try {
-		files = getNotes().listFiles(undefined, 500);
+		stats = getNotes().measureStats(5);
 	} catch {
 		return lines;
 	}
 	const fileWarn = Math.max(1, Math.floor(config.notesMaxFileBytes / 16));
 	const totalWarn = Math.max(1, Math.floor(config.notesMaxFileBytes / 4));
-	const oversized = files.filter((f) => f.bytes > fileWarn).slice(0, 5);
+	const oversized = stats.largestFiles.filter((f) => f.bytes > fileWarn);
 	for (const f of oversized) {
 		lines.push(
 			`⚠ note "${f.path}" is ${f.bytes} bytes (> ${fileWarn}): checkpoints work best concise — prune obsolete content or split the file before it approaches the ${config.notesMaxFileBytes} byte cap.`,
 		);
 	}
-	const total = files.reduce((sum, f) => sum + f.bytes, 0);
-	if (total > totalWarn) {
+	if (stats.totalBytes > totalWarn) {
 		lines.push(
-			`⚠ total notes size ${total} bytes across ${files.length} files (> ${totalWarn}): consider deleting obsolete note files (notes list) — recovery reads checkpoints, not archives.`,
+			`⚠ total notes size ${stats.totalBytes} bytes across ${stats.totalFiles} files (> ${totalWarn}): consider deleting obsolete note files (notes delete) — recovery reads checkpoints, not archives.`,
 		);
 	}
 	return lines;

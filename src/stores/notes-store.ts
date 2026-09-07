@@ -20,6 +20,18 @@ export interface NoteReadResult {
 	totalChars: number;
 }
 
+export interface NoteFileInfo {
+	path: string;
+	bytes: number;
+	updatedAt: string;
+}
+
+export interface NotesStats {
+	totalFiles: number;
+	totalBytes: number;
+	largestFiles: Array<Pick<NoteFileInfo, "path" | "bytes">>;
+}
+
 export class NotesStore {
 	private readonly root: string;
 	private readonly maxFileBytes: number;
@@ -58,11 +70,9 @@ export class NotesStore {
 	 * when more than one file exists — otherwise the hint would just echo the
 	 * file being appended. */
 	private largestFilesHint(top = 3): string {
-		const files = this.listFiles()
-			.sort((a, b) => b.bytes - a.bytes)
-			.slice(0, top);
-		if (files.length < 2) return "";
-		return ` Largest note files: ${files.map((f) => `${f.path} (${f.bytes} bytes)`).join(", ")}.`;
+		const stats = this.measureStats(top);
+		if (stats.totalFiles < 2) return "";
+		return ` Largest note files: ${stats.largestFiles.map((f) => `${f.path} (${f.bytes} bytes)`).join(", ")}.`;
 	}
 
 	writeFile(notePath: string, text: string): void {
@@ -70,7 +80,7 @@ export class NotesStore {
 		const size = Buffer.byteLength(text, "utf8");
 		if (size > this.maxFileBytes) {
 			throw new NotesError(
-				`content is ${size} bytes; note files must stay at or below ${this.maxFileBytes} bytes. Write a smaller file, split across several files, or prune obsolete notes first (notes list).${this.largestFilesHint()}`,
+				`content is ${size} bytes; note files must stay at or below ${this.maxFileBytes} bytes. Write a smaller file, split across several files, or prune obsolete notes first (notes delete).${this.largestFilesHint()}`,
 			);
 		}
 		fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -84,11 +94,19 @@ export class NotesStore {
 		if (existing + addition > this.maxFileBytes) {
 			const remaining = Math.max(0, this.maxFileBytes - existing);
 			throw new NotesError(
-				`append would grow "${notePath}" to ${existing + addition} bytes; note files must stay at or below ${this.maxFileBytes} bytes (only ${remaining} bytes left in this file). Split the append into a smaller piece or create another file. Run notes list to review which files can be pruned — the budget reminder also suggests cleaning obsolete notes.${this.largestFilesHint()}`,
+				`append would grow "${notePath}" to ${existing + addition} bytes; note files must stay at or below ${this.maxFileBytes} bytes (only ${remaining} bytes left in this file). Split the append into a smaller piece or create another file. Run notes list to review which files can be pruned — the budget reminder also suggests cleaning obsolete notes with notes delete.${this.largestFilesHint()}`,
 			);
 		}
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.appendFileSync(file, text, "utf8");
+	}
+
+	deleteFile(notePath: string): void {
+		const file = this.resolve(notePath);
+		if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+			throw new NotesError(`no note file at "${notePath}"`);
+		}
+		fs.unlinkSync(file);
 	}
 
 	readFile(notePath: string, startLine?: number, stopLine?: number, offsetChars?: number, limitChars?: number): NoteReadResult {
@@ -115,7 +133,7 @@ export class NotesStore {
 		return { content: selected.slice(offset, end), totalChars };
 	}
 
-	listFiles(prefix?: string, maxResults?: number): Array<{ path: string; bytes: number; updatedAt: string }> {
+	listFiles(prefix?: string, maxResults?: number): NoteFileInfo[] {
 		const base = prefix ? this.resolve(prefix) : this.root;
 		if (!fs.existsSync(base)) return [];
 		const out: Array<{ path: string; bytes: number; updatedAt: string }> = [];
@@ -147,6 +165,40 @@ export class NotesStore {
 		walk(base);
 		out.sort((a, b) => a.path.localeCompare(b.path));
 		return maxResults ? out.slice(0, Math.max(1, maxResults)) : out;
+	}
+
+	/** Return complete size/count totals and only the largest file entries. */
+	measureStats(top = 5): NotesStats {
+		const limit = Math.max(0, Math.floor(top));
+		let totalFiles = 0;
+		let totalBytes = 0;
+		const largestFiles: Array<Pick<NoteFileInfo, "path" | "bytes">> = [];
+
+		const consider = (file: Pick<NoteFileInfo, "path" | "bytes">): void => {
+			totalFiles++;
+			totalBytes += file.bytes;
+			if (limit === 0) return;
+			largestFiles.push(file);
+			largestFiles.sort((a, b) => b.bytes - a.bytes || a.path.localeCompare(b.path));
+			if (largestFiles.length > limit) largestFiles.pop();
+		};
+
+		const walk = (dir: string): void => {
+			const entries = fs.readdirSync(dir, { withFileTypes: true });
+			for (const ent of entries) {
+				const full = path.join(dir, ent.name);
+				if (ent.isDirectory()) walk(full);
+				else if (ent.isFile()) {
+					consider({
+						path: path.relative(this.root, full).split(path.sep).join("/"),
+						bytes: fs.statSync(full).size,
+					});
+				}
+			}
+		};
+
+		if (fs.existsSync(this.root)) walk(this.root);
+		return { totalFiles, totalBytes, largestFiles };
 	}
 
 	searchContents(query: string, prefix?: string, maxFiles?: number, maxMatchesPerFile?: number): Array<{ path: string; line: number; text: string }> {

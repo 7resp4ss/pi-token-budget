@@ -70,12 +70,34 @@ export function freshState(sessionId: string): WindowState {
 	};
 }
 
+export function isValidWindowState(value: unknown, sessionId: string): value is WindowState {
+	if (!value || typeof value !== "object") return false;
+	const state = value as Partial<WindowState>;
+	if (state.version !== 1 || state.sessionId !== sessionId) return false;
+	const windowNumber = state.windowNumber;
+	if (typeof windowNumber !== "number" || !Number.isInteger(windowNumber) || windowNumber < 1) return false;
+	if (state.firstWindowId !== windowIdFor(1)) return false;
+	if (state.currentWindowId !== windowIdFor(windowNumber)) return false;
+	if (windowNumber === 1) {
+		if (state.previousWindowId !== null) return false;
+	} else if (state.previousWindowId !== windowIdFor(windowNumber - 1)) {
+		return false;
+	}
+	return (
+		typeof state.reminderDelivered === "boolean" &&
+		typeof state.fallbackDelivered === "boolean" &&
+		typeof state.pendingNewContext === "boolean" &&
+		typeof state.fallbackActive === "boolean" &&
+		typeof state.hardRolloverLatched === "boolean"
+	);
+}
+
 export function loadState(sessionDir: string, sessionId: string): WindowState {
 	const file = stateFilePath(sessionDir, sessionId);
 	try {
 		const raw = fs.readFileSync(file, "utf8");
-		const parsed = JSON.parse(raw) as WindowState;
-		if (parsed?.version === 1 && parsed.sessionId === sessionId && typeof parsed.currentWindowId === "string") {
+		const parsed = JSON.parse(raw) as unknown;
+		if (isValidWindowState(parsed, sessionId)) {
 			return parsed;
 		}
 	} catch {

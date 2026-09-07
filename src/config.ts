@@ -107,22 +107,72 @@ const NUMBER_KEYS = [
 	"historyItemPreviewChars",
 ] as const;
 
+const NUMERIC_KEY_SET = new Set<string>(NUMBER_KEYS);
+
+type ConfigWarningSink = (message: string) => void;
+
+function normalizeNumber(key: string, value: number): number | undefined {
+	if (key === "reminderRemainingPercent") {
+		return value > 0 && value < 1 ? value : undefined;
+	}
+	const normalized = Math.floor(value);
+	if (key === "maxToolOutputChars" || key === "notesMaxFileBytes" || key === "historyItemPreviewChars") {
+		return normalized >= 1 ? normalized : undefined;
+	}
+	return normalized >= 0 ? normalized : undefined;
+}
+
+function sanitizeNumericFields(
+	section: Record<string, unknown>,
+	allowedKeys: Set<string>,
+	warn: ConfigWarningSink,
+	source: string,
+): Partial<TokenBudgetConfig> {
+	const sanitized: Partial<TokenBudgetConfig> = {};
+	for (const key of NUMBER_KEYS) {
+		if (!allowedKeys.has(key) || !(key in section)) continue;
+		const n = coerceNumber(section[key]);
+		if (n === undefined) {
+			warn(`${source}.${key} must be a finite number; keeping the previous value`);
+			continue;
+		}
+		const normalized = normalizeNumber(key, n);
+		if (normalized === undefined) {
+			const range =
+				key === "reminderRemainingPercent"
+					? "strictly between 0 and 1"
+					: key === "hardRolloverUsedTokens" || key.includes("FloorTokens") || key.includes("CeilingTokens")
+						? "at least 0"
+						: "at least 1";
+			warn(`${source}.${key} must be ${range}; keeping the previous value`);
+			continue;
+		}
+		(sanitized as Record<string, number>)[key] = normalized;
+	}
+	return sanitized;
+}
+
 function applySection(
 	base: TokenBudgetConfig,
 	section: unknown,
-	allowedKeys = new Set<string>(NUMBER_KEYS),
+	allowedKeys = NUMERIC_KEY_SET,
 	allowEnabled = true,
+	warn: ConfigWarningSink = () => {},
+	source = "tokenBudget",
 ): TokenBudgetConfig {
-	if (!section || typeof section !== "object") return base;
+	if (section === undefined || section === null) return base;
+	if (typeof section !== "object") {
+		warn(`${source} must be an object; keeping the previous values`);
+		return base;
+	}
 	const s = section as Record<string, unknown>;
 	const next = { ...base };
-	const enabled = coerceBoolean(s.enabled);
-	if (allowEnabled && enabled !== undefined) next.enabled = enabled;
-	for (const key of NUMBER_KEYS) {
-		if (!allowedKeys.has(key)) continue;
-		const n = coerceNumber(s[key]);
-		if (n !== undefined && n >= 0) next[key] = n;
+	if (allowEnabled && "enabled" in s) {
+		const enabled = coerceBoolean(s.enabled);
+		if (enabled === undefined) warn(`${source}.enabled must be boolean; keeping the previous value`);
+		else next.enabled = enabled;
 	}
+	Object.assign(next, sanitizeNumericFields(s, allowedKeys, warn, source));
 	return next;
 }
 
@@ -185,45 +235,84 @@ function applyEnvironmentOverrides(config: TokenBudgetConfig): TokenBudgetConfig
 		next.reminderRemainingPercent = envPercent;
 	}
 	const envHard = coerceNumber(Number(process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS));
-	if (envHard !== undefined && envHard > 0) next.hardRolloverUsedTokens = envHard;
+	if (envHard !== undefined && envHard >= 0) next.hardRolloverUsedTokens = Math.floor(envHard);
 	return next;
+}
+
+function warnAboutEnvironmentOverrides(warn: ConfigWarningSink): void {
+	const envPercent = process.env.PI_TOKEN_BUDGET_REMINDER_PERCENT;
+	if (envPercent !== undefined) {
+		const value = coerceNumber(Number(envPercent));
+		if (value === undefined || value <= 0 || value >= 1) {
+			warn("PI_TOKEN_BUDGET_REMINDER_PERCENT must be strictly between 0 and 1; ignoring it");
+		}
+	}
+	const envHard = process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS;
+	if (envHard !== undefined) {
+		const value = coerceNumber(Number(envHard));
+		if (value === undefined || value < 0) {
+			warn("PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS must be at least 0; ignoring it");
+		}
+	}
 }
 
 export function loadConfig(): ConfigBundle {
 	let defaults = { ...DEFAULTS };
 	const models: Record<string, Partial<TokenBudgetConfig>> = {};
+	const warnings: string[] = [];
+	const warn: ConfigWarningSink = (message) => warnings.push(message);
+	const settingsPath = agentSettingsPath();
+	let raw: string | undefined;
 	try {
-		const raw = fs.readFileSync(agentSettingsPath(), "utf8");
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		const section = parsed?.tokenBudget;
-		if (section && typeof section === "object") {
-			const s = section as Record<string, unknown>;
-			if (s.defaults || s.models) {
-				defaults = applySection(defaults, s.defaults);
-				if (s.models && typeof s.models === "object") {
-					for (const [pattern, override] of Object.entries(s.models as Record<string, unknown>)) {
-						if (override && typeof override === "object") {
-							const unsupported = Object.keys(override as Record<string, unknown>).filter(
-								(key) => (key === "enabled" || NUMBER_KEYS.includes(key as (typeof NUMBER_KEYS)[number])) && !MODEL_OVERRIDE_KEYS.has(key),
-							);
-							if (unsupported.length > 0) {
-								console.warn(
-									`pi-token-budget: model config "${pattern}" ignores global-only fields: ${unsupported.join(", ")}`,
+		raw = fs.readFileSync(settingsPath, "utf8");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") warn(`could not read ${settingsPath}; keeping defaults where needed`);
+		raw = undefined;
+	}
+	if (raw !== undefined) {
+		try {
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const section = parsed?.tokenBudget;
+			if (section === undefined) {
+				// No tokenBudget section is a valid no-op.
+			} else if (section && typeof section === "object") {
+				const s = section as Record<string, unknown>;
+				if (s.defaults || s.models) {
+					defaults = applySection(defaults, s.defaults, NUMERIC_KEY_SET, true, warn, "tokenBudget.defaults");
+					if (s.models && typeof s.models === "object") {
+						for (const [pattern, override] of Object.entries(s.models as Record<string, unknown>)) {
+							if (override && typeof override === "object") {
+								const unsupported = Object.keys(override as Record<string, unknown>).filter(
+									(key) => (key === "enabled" || NUMBER_KEYS.includes(key as (typeof NUMBER_KEYS)[number])) && !MODEL_OVERRIDE_KEYS.has(key),
+								);
+								if (unsupported.length > 0) {
+									warn(`model config "${pattern}" ignores global-only fields: ${unsupported.join(", ")}`);
+								}
+								models[pattern] = sanitizeNumericFields(
+									override as Record<string, unknown>,
+									MODEL_OVERRIDE_KEYS,
+									warn,
+									`tokenBudget.models[${pattern}]`,
 								);
 							}
-							models[pattern] = override as Partial<TokenBudgetConfig>;
 						}
 					}
+				} else {
+					// Flat shape: applies to every model.
+					defaults = applySection(defaults, s, NUMERIC_KEY_SET, true, warn, "tokenBudget");
 				}
 			} else {
-				// Flat shape: applies to every model.
-				defaults = applySection(defaults, s);
+				warn("tokenBudget must be an object; keeping defaults");
 			}
+		} catch {
+			warn(`could not parse ${settingsPath}; keeping defaults where needed`);
 		}
-	} catch {
-		// Missing or invalid settings file: keep defaults.
 	}
 
+	warnAboutEnvironmentOverrides(warn);
+	if (warnings.length > 0) {
+		console.warn(`pi-token-budget: configuration warnings: ${warnings.join("; ")}`);
+	}
 	if (process.env.PI_TOKEN_BUDGET_DISABLED === "1") defaults.enabled = false;
 	return { defaults, models };
 }

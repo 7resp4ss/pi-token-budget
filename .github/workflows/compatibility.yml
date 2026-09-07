@@ -1,0 +1,25 @@
+name: Compatibility
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-dependency-set: [pinned, latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install latest Pi contracts
+        if: matrix.pi-dependency-set == 'latest'
+        run: npm install --no-save --package-lock=false @earendil-works/pi-agent-core@latest @earendil-works/pi-coding-agent@latest
+      - run: npm run typecheck
+      - run: npm test

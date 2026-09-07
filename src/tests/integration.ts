@@ -201,9 +201,25 @@ function currentWindowId(h: ReturnType<typeof createHarness>): string {
 	return match[1];
 }
 
+function toolText(result: unknown): string {
+	return ((result as { content: Array<{ type: string; text: string }> }).content[0] ?? { text: "" }).text;
+}
+
 const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-token-budget-agentdir-"));
 process.env.PI_AGENT_DIR = agentDir;
 process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
+
+// Native Pi compaction does not contain this plugin's bootstrap guidance.
+{
+	const h = createHarness("native-compaction", [
+		{ id: "native-compaction", type: "compaction", summary: "pi native summary, no plugin marker" },
+	]);
+	assert.equal(
+		h.getBranch().filter((entry) => (entry as { customType?: string }).customType === CUSTOM_TYPE_CONTEXT_WINDOW).length,
+		1,
+	);
+	h.cleanup();
+}
 
 // Guidance is persisted immediately; budget prompts are queued as steer and
 // only become branch facts when consumed.
@@ -224,6 +240,21 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	assert.equal(h.getBranch().length, 1, "queued steer must not enter branch before consumption");
 	h.consumeSteer();
 	assert.equal(h.getBranch().length, 2);
+	h.cleanup();
+}
+
+// Notes delete is exposed as an explicit, path-safe model operation.
+{
+	const h = createHarness("notes-delete");
+	const notesTool = h.tools.get("notes")!;
+	const written = await notesTool.execute("write", { operation: "write", path: "obsolete.md", text: "old" }, undefined, undefined, h.ctx);
+	assert.match(toolText(written), /Wrote 3 bytes/);
+	const deleted = await notesTool.execute("delete", { operation: "delete", path: "obsolete.md" }, undefined, undefined, h.ctx);
+	assert.equal(toolText(deleted), "Deleted obsolete.md.");
+	const missing = await notesTool.execute("delete-missing", { operation: "delete", path: "obsolete.md" }, undefined, undefined, h.ctx);
+	assert.match(toolText(missing), /no note file/);
+	const escaped = await notesTool.execute("delete-escaped", { operation: "delete", path: "../outside" }, undefined, undefined, h.ctx);
+	assert.match(toolText(escaped), /unsupported path component/);
 	h.cleanup();
 }
 
@@ -284,7 +315,7 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 		assert.equal(blocked.block, true, `${toolName} must be blocked`);
 		assert.equal(blocked.terminate, true, `${toolName} must terminate the batch`);
 	}
-	for (const operation of ["read", "search", "list"]) {
+	for (const operation of ["read", "search", "list", "delete"]) {
 		const blocked = h.fire("tool_call", {
 			type: "tool_call",
 			toolCallId: `blocked-notes-${operation}`,
