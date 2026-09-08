@@ -88,7 +88,7 @@ Alternatives:
 
 ```bash
 # git (pinnable version)
-pi install git:github.com/7resp4ss/pi-token-budget@v1.1.7
+pi install git:github.com/7resp4ss/pi-token-budget@v1.1.8
 
 # Try without installing
 pi -e npm:pi-token-budget
