@@ -56,6 +56,8 @@
 
 **防爆炸保证**：参数级分页（字符 offset/limit、条数 limit）+ 输出统一截断（`maxToolOutputChars`）——任何操作都无法返回无界内容。
 
+**惰性渲染**：构造只做零分配的元数据扫描（id/角色/窗口分段/纳入判定）；条目文本仅在 read_item / list_items / search 实际触及时按需渲染（search 凑满 limit 即短路），长会话不产生全量字符串分配。
+
 ## 共享约定
 
 - 所有工具描述末尾附 `TOOL_PRIVATE_USAGE_HINT`（私有簿记，不对用户泄露）

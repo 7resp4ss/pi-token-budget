@@ -357,5 +357,95 @@ assert.deepEqual(
 );
 assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 
+// --- history lazy rendering ----------------------------------------------
+// The constructor is a metadata-only pass; text is built per touched entry.
+{
+	const lazy = new HistoryStore(branch as never);
+	assert.equal(lazy.renderedTextCount(), 0, "constructor must not render any entry text");
+	assert.equal(lazy.readItem("e1", 0, 5).text, "hello");
+	assert.equal(lazy.renderedTextCount(), 1, "readItem renders exactly one entry");
+
+	const lazyAll = new HistoryStore(branch as never);
+	const lazyItems = lazyAll.listItems({ previewChars: 50 });
+	assert.equal(lazyItems.length, 7);
+	assert.equal(lazyAll.renderedTextCount(), 6, "full listItems renders only the page's content entries (compaction summary is a plain reference)");
+	assert.equal(lazyItems[0].chars, "hello remote compact".length, "chars stays exact under lazy rendering");
+
+	// Repeated paginated reads of one item render independently and correctly.
+	const paged = new HistoryStore(branch as never);
+	const p1 = paged.readItem("e1", 0, 5);
+	const p2 = paged.readItem("e1", 5, 100);
+	assert.equal(p1.text, "hello");
+	assert.equal(p2.text, " remote compact");
+	assert.equal(p1.totalChars, p2.totalChars);
+	assert.equal(paged.renderedTextCount(), 2);
+}
+
+// Inclusion/exclusion equivalence: the cheap metadata pass must exactly
+// mirror the rendered-text emptiness rules, including block contributions.
+{
+	const edgeBranch = [
+		// thinking-only assistant → renders empty → excluded, never counted
+		{ id: "x1", type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }] } },
+		// whitespace-only user text → excluded
+		{ id: "x2", type: "message", message: { role: "user", content: [{ type: "text", text: "   \n\t " }] } },
+		// empty toolResult → included with placeholder
+		{ id: "x3", type: "message", message: { role: "toolResult", content: [{ type: "text", text: "" }] } },
+		// content neither string nor array → excluded
+		{ id: "x4", type: "message", message: { role: "assistant", content: 42 } },
+		// unknown block type → included, renders "[foo block omitted]"
+		{ id: "x5", type: "message", message: { role: "assistant", content: [{ type: "foo", data: 1 }] } },
+		// toolResult blocks inside assistant content contribute nothing
+		{ id: "x6", type: "message", message: { role: "assistant", content: [{ type: "toolResult", content: "ignored" }, { type: "thinking" }] } },
+		// plain string content → included
+		{ id: "x7", type: "message", message: { role: "user", content: "plain string request" } },
+		// compaction with empty summary → still included
+		{ id: "x8", type: "compaction", summary: "" },
+	];
+	const edgeStore = new HistoryStore(edgeBranch as never);
+	assert.deepEqual(
+		edgeStore.listItems({ previewChars: 200 }).map((i) => i.itemId),
+		["x3", "x5", "x7", "x8"],
+	);
+	assert.equal(edgeStore.readItem("x3", 0, 100).text, "[empty tool result]");
+	assert.ok(edgeStore.readItem("x5", 0, 100).text.includes("[foo block omitted]"));
+	const w1 = edgeStore.listWindows().find((w) => w.windowId === "w1");
+	assert.ok(w1);
+	assert.equal(w1.itemCount, 3, "empty-render entries never enter window counts");
+	assert.equal(edgeStore.readItem("x8", 0, 10).windowId, "w2", "compaction opens a new window even with empty summary");
+}
+
+// Laziness holds at scale: a single read_item renders exactly one entry
+// regardless of branch size (no timing assertions, no flake).
+{
+	const bigBranch: unknown[] = [];
+	for (let i = 0; i < 5000; i++) {
+		bigBranch.push({
+			id: `big-${i}`,
+			type: "message",
+			message: { role: "assistant", content: [{ type: "text", text: `turn ${i} payload` }] },
+		});
+	}
+	const bigStore = new HistoryStore(bigBranch as never);
+	const bigRead = bigStore.readItem("big-4999", 0, 9);
+	assert.equal(bigRead.text, "turn 4999");
+	assert.equal(bigStore.renderedTextCount(), 1, "single read_item renders exactly one entry");
+
+	// search short-circuits in scan order: identical result set to
+	// filter-all-then-slice, without rendering past the limit-th match.
+	const recentStore = new HistoryStore(bigBranch as never);
+	assert.deepEqual(
+		recentStore.searchContents("turn", { limit: 3, recentFirst: true, previewChars: 50 }).map((m) => m.itemId),
+		["big-4999", "big-4998", "big-4997"],
+	);
+	assert.equal(recentStore.renderedTextCount(), 3, "recent-first search stops after limit matches");
+	const forwardStore = new HistoryStore(bigBranch as never);
+	assert.deepEqual(
+		forwardStore.searchContents("turn", { limit: 2, previewChars: 50 }).map((m) => m.itemId),
+		["big-0", "big-1"],
+	);
+	assert.equal(forwardStore.renderedTextCount(), 2, "forward search stops after limit matches");
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("smoke: all assertions passed");
