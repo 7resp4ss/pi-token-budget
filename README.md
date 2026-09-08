@@ -150,7 +150,7 @@ Coexists with [pi-subagents](https://github.com/nicobailon/pi-subagents) (`pi in
 **Mind the tools whitelist**: pi-subagents' built-in agents declare `tools:` whitelists, and tools not on the list (including this extension's 4 tools) are unavailable inside those subagents — the rollover choreography then degrades to the forced path. To fix it, add the 4 tools to the whitelists of the agents you use: place a full definition in the user-level agents directory (`~/.pi/agent/agents/<name>.md` — a same-named file overrides the built-in definition entirely) and extend the tools line:
 
 ```yaml
-tools: read, grep, find, ls, bash, edit, write, contact_supervisor, get_context_remaining, new_context, notes, history
+tools: read, grep, find, ls, bash, edit, write, ..., get_context_remaining, new_context, notes, history
 ```
 
 If you'd rather keep this extension out of subagents, declare `extensions: []` in the agent definition.
