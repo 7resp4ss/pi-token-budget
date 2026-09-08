@@ -36,7 +36,7 @@ const HISTORY_PARAMS = Type.Object({
 	item_id: Type.Optional(Type.String({ description: "Item id returned by list/search. Required for read_item." })),
 	window_id: Type.Optional(Type.String({ description: "Window id from list_windows. Optional filter." })),
 	query: Type.Optional(Type.String({ description: "Literal substring for search_contents." })),
-	role: Type.Optional(Type.String({ description: "Optional role filter: user | assistant | toolResult | custom | compaction." })),
+	role: Type.Optional(Type.String({ description: "Optional role filter: user | assistant | toolResult | custom | bashExecution | compaction | branchSummary." })),
 	offset_chars: Type.Optional(Type.Integer({ description: "Zero-based char offset for read_item.", minimum: 0 })),
 	limit_chars: Type.Optional(
 		Type.Integer({

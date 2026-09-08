@@ -50,7 +50,7 @@
 | `list_windows` | — | `(window_id, item_count)` 元数据，**零内容** |
 | `list_items` | `window_id?`, `role?`, `limit?`, `recent_first?` | 截断预览条目 |
 | `read_item` | `item_id`†, `offset_chars?`, `limit_chars?` | **字符级分页**读取单条 |
-| `search_contents` | `query`†, `window_id?`, `role?`, `limit?` | 匹配条目 + 定位预览 |
+| `search_contents` | `query`†, `window_id?`, `role?`, `limit?`, `recent_first?` | 匹配条目 + 定位预览 |
 
 † 必填。
 
