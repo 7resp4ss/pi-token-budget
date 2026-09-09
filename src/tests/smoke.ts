@@ -121,7 +121,9 @@ fs.rmSync(invalidEnvAgentDir, { recursive: true, force: true });
 // Settings use the same bounds as environment overrides and warn once.
 const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-token-budget-config-"));
 const previousAgentDir = process.env.PI_AGENT_DIR;
+const previousCodingAgentDirForSettings = process.env.PI_CODING_AGENT_DIR;
 process.env.PI_AGENT_DIR = configDir;
+process.env.PI_CODING_AGENT_DIR = configDir;
 fs.writeFileSync(
 	path.join(configDir, "settings.json"),
 	JSON.stringify({
@@ -150,6 +152,8 @@ assert.equal(invalidConfig.defaults.historyItemPreviewChars, DEFAULTS.historyIte
 assert.equal(configWarningCount, 1);
 if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
 else process.env.PI_AGENT_DIR = previousAgentDir;
+if (previousCodingAgentDirForSettings === undefined) delete process.env.PI_CODING_AGENT_DIR;
+else process.env.PI_CODING_AGENT_DIR = previousCodingAgentDirForSettings;
 fs.rmSync(configDir, { recursive: true, force: true });
 
 // --- prompts ----------------------------------------------------------------

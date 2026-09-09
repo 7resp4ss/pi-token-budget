@@ -2,7 +2,7 @@
  * Plugin configuration.
  *
  * Settings are read from the `tokenBudget` key in the agent settings file
- * (~/.pi/agent/settings.json, or $PI_AGENT_DIR/settings.json), with
+ * (~/.pi/agent/settings.json, or the configured Pi agent directory), with
  * environment variable overrides for quick experimentation.
  *
  * Two shapes are supported:
@@ -85,7 +85,8 @@ const MODEL_OVERRIDE_KEYS = new Set<string>([
 ]);
 
 function agentSettingsPath(): string {
-	const agentDir = process.env.PI_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+	const agentDir =
+		process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 	return path.join(agentDir, "settings.json");
 }
 
