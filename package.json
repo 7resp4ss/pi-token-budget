@@ -38,7 +38,9 @@
 		"smoke": "node --experimental-strip-types src/tests/smoke.ts",
 		"integration": "node --experimental-strip-types src/tests/integration.ts",
 		"contract": "node --experimental-strip-types src/tests/pi-agent-core-contract.ts",
-		"test": "npm run smoke && npm run integration && npm run contract"
+		"test": "npm run smoke && npm run integration && npm run contract && npm run coordination && npm run coordination-integration",
+		"coordination": "node --experimental-strip-types src/tests/coordination.ts",
+		"coordination-integration": "node --experimental-strip-types src/tests/coordination-integration.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",

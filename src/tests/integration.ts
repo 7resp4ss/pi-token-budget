@@ -11,6 +11,11 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import tokenBudgetExtension from "../index.ts";
 import {
+	COORD_CHANNEL_STATE,
+	isCoordinationState,
+	type TokenBudgetCoordinationState,
+} from "../coordination.ts";
+import {
 	BOOTSTRAP_MARKER,
 	CUSTOM_TYPE_CONTEXT_WINDOW,
 	CUSTOM_TYPE_CONTINUE,
@@ -41,6 +46,11 @@ interface CompactResult {
 	compaction?: { summary: string; firstKeptEntryId: string; tokensBefore: number };
 }
 
+interface CompactCallbacks {
+	onComplete?(): void;
+	onError?(error: Error): void;
+}
+
 function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}`, initialBranch: unknown[] = []) {
 	const handlers = new Map<string, Handler>();
 	const tools = new Map<
@@ -59,6 +69,22 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 	const steering: CustomMessage[] = [];
 	const followUps: CustomMessage[] = [];
 	const triggeredTurns: CustomMessage[] = [];
+	const compactRequests: CompactCallbacks[] = [];
+	const coordinationStates: TokenBudgetCoordinationState[] = [];
+	const busHandlers = new Map<string, Set<(data: unknown) => void>>();
+	const events = {
+		on: (channel: string, cb: (data: unknown) => void) => {
+			if (!busHandlers.has(channel)) busHandlers.set(channel, new Set());
+			busHandlers.get(channel)!.add(cb);
+			return () => busHandlers.get(channel)?.delete(cb);
+		},
+		emit: (channel: string, data: unknown) => {
+			for (const cb of [...(busHandlers.get(channel) ?? [])]) cb(data);
+		},
+	};
+	events.on(COORD_CHANNEL_STATE, (data) => {
+		if (isCoordinationState(data)) coordinationStates.push(data);
+	});
 	let branch: unknown[] = initialBranch;
 	let entryCounter = 0;
 	let idle = true;
@@ -93,6 +119,7 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 			else if (opts.deliverAs === "steer") steering.push(message);
 			else triggeredTurns.push(message);
 		},
+		events,
 	} as unknown as ExtensionAPI;
 
 	const harness = {
@@ -104,9 +131,13 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 		steering,
 		followUps,
 		triggeredTurns,
+		coordinationStates,
 		dir,
 		get compactCalls() {
 			return compactCalls;
+		},
+		get compactRequests() {
+			return compactRequests;
 		},
 		setIdle(value: boolean) {
 			idle = value;
@@ -143,12 +174,22 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 			return handler(enriched, harness.ctx);
 		},
 		threshold(reason: "threshold" | "manual" | "overflow" = "threshold", tokensBefore = 195_000): CompactResult {
-			return harness.fire("session_before_compact", {
+			const result = harness.fire("session_before_compact", {
 				type: "session_before_compact",
 				reason,
 				willRetry: false,
 				preparation: { tokensBefore },
 			}) as CompactResult;
+			if (result.cancel) {
+				harness.fire("session_compact_failed", {
+					type: "session_compact_failed",
+					reason,
+					aborted: true,
+					willRetry: false,
+					fromExtension: false,
+				});
+			}
+			return result;
 		},
 		commit(compaction: NonNullable<CompactResult["compaction"]>, streaming = false): void {
 			idle = !streaming;
@@ -164,6 +205,19 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 					tokensBefore: compaction.tokensBefore,
 				},
 			});
+		},
+		failCompact(errorMessage: string): void {
+			harness.fire("session_compact_failed", {
+				type: "session_compact_failed",
+				reason: "manual",
+				aborted: false,
+				willRetry: false,
+				fromExtension: true,
+				errorMessage,
+			});
+			const request = compactRequests.shift();
+			assert.ok(request, "expected a pending ctx.compact request");
+			request.onError?.(new Error(errorMessage));
 		},
 		cleanup() {
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -181,8 +235,9 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 				? { tokens: null, contextWindow: usage.contextWindow, percent: null }
 				: { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: 50 },
 		isIdle: () => idle,
-		compact: () => {
+		compact: (callbacks: CompactCallbacks) => {
 			compactCalls++;
+			compactRequests.push(callbacks);
 		},
 		ui: { notify: (_message: string, _level: string) => {} },
 	} as unknown as ExtensionContext;
@@ -497,6 +552,58 @@ for (const reason of ["manual", "overflow"] as const) {
 	h.cleanup();
 }
 
+// Pi reports an extension-cancelled threshold compaction as
+// session_compact_failed(aborted=true). That attempt must not consume the
+// hard-rollover intent; otherwise the lost-fallback recovery cannot run.
+{
+	const h = createHarness("hard-cancel-preserves-rollover");
+	h.setUsage(181_000, 200_000);
+	h.setIdle(false);
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+	assert.equal(h.sent.at(-1)?.customType, CUSTOM_TYPE_FALLBACK);
+
+	assert.deepEqual(h.threshold(), { cancel: true });
+	assert.deepEqual(
+		{ phase: h.coordinationStates.at(-1)?.phase, error: h.coordinationStates.at(-1)?.error },
+		{ phase: "checkpoint_required", error: undefined },
+	);
+	h.dropSteering();
+
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.steering.length, 1, "aborted threshold attempt must preserve lost-fallback recovery");
+	const fallback = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: fallback.customType, content: fallback.content, details: fallback.details },
+	});
+
+	const notes = h.tools.get("notes")!;
+	assert.equal(
+		h.fire("tool_call", {
+			type: "tool_call",
+			toolCallId: "checkpoint-after-cancel",
+			toolName: "notes",
+			input: { operation: "write", path: "checkpoint.md", text: "state" },
+		}),
+		undefined,
+	);
+	await notes.execute(
+		"checkpoint-after-cancel",
+		{ operation: "write", path: "checkpoint.md", text: "state" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 1, "hard rollover must still compact after the recovered checkpoint");
+	const result = h.threshold("manual", 181_000);
+	assert.ok(result.compaction);
+	h.commit(result.compaction!);
+	assert.equal(h.coordinationStates.at(-1)?.windowId, "w2");
+	h.cleanup();
+}
+
 // Repeated new_context calls are collapsed by pendingNewContext and
 // compactionInFlight without changing the public tool result.
 {
@@ -537,6 +644,84 @@ for (const reason of ["manual", "overflow"] as const) {
 	h.commit(result.compaction!, true);
 	assert.equal(h.sent.at(-1)?.customType, CUSTOM_TYPE_CONTINUE);
 	assert.deepEqual(h.sent.at(-1)?.opts, { triggerTurn: true, deliverAs: "steer" });
+	h.cleanup();
+}
+
+// A deferred rollover that fails before session_before_compact must publish
+// the real post-cleanup phase instead of leaving clients at rolling_over.
+{
+	const h = createHarness("failure-before-before-compact");
+	h.setIdle(false);
+	await h.tools.get("new_context")!.execute("nc-fail-early", {}, undefined, undefined, h.ctx);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 1);
+	assert.equal(h.coordinationStates.at(-1)?.phase, "rolling_over");
+
+	h.failCompact("Nothing to compact");
+	assert.deepEqual(
+		{ phase: h.coordinationStates.at(-1)?.phase, error: h.coordinationStates.at(-1)?.error },
+		{ phase: "ready", error: "Nothing to compact" },
+	);
+	h.cleanup();
+}
+
+// The same cleanup is required after session_before_compact created a
+// pending window: pendingWindow and pendingNewContext must both be cleared.
+{
+	const h = createHarness("failure-after-before-compact");
+	h.setIdle(false);
+	await h.tools.get("new_context")!.execute("nc-fail-pending", {}, undefined, undefined, h.ctx);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.ok(h.threshold("manual", 160_000).compaction);
+	assert.equal(h.coordinationStates.at(-1)?.phase, "rolling_over");
+
+	h.failCompact("provider rejected compaction");
+	assert.deepEqual(
+		{ phase: h.coordinationStates.at(-1)?.phase, error: h.coordinationStates.at(-1)?.error },
+		{ phase: "ready", error: "provider rejected compaction" },
+	);
+	h.cleanup();
+}
+
+// A failed fallback/checkpoint rollover reopens the checkpoint fence and
+// advertises checkpoint_required so the continuation owner does not resume.
+{
+	const h = createHarness("failure-checkpoint-required");
+	h.setUsage(181_000, 200_000);
+	h.setIdle(false);
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+	const fallback = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: fallback.customType, content: fallback.content, details: fallback.details },
+	});
+	const notes = h.tools.get("notes")!;
+	assert.equal(
+		h.fire("tool_call", {
+			type: "tool_call",
+			toolCallId: "checkpoint-before-failure",
+			toolName: "notes",
+			input: { operation: "write", path: "checkpoint.md", text: "state" },
+		}),
+		undefined,
+	);
+	await notes.execute(
+		"checkpoint-before-failure",
+		{ operation: "write", path: "checkpoint.md", text: "state" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.ok(h.threshold("manual", 181_000).compaction);
+	h.failCompact("checkpoint rollover failed");
+	assert.deepEqual(
+		{ phase: h.coordinationStates.at(-1)?.phase, error: h.coordinationStates.at(-1)?.error },
+		{ phase: "checkpoint_required", error: "checkpoint rollover failed" },
+	);
 	h.cleanup();
 }
 

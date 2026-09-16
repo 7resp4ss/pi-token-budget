@@ -155,6 +155,17 @@ tools: read, grep, find, ls, bash, edit, write, ..., get_context_remaining, new_
 
 If you'd rather keep this extension out of subagents, declare `extensions: []` in the agent definition.
 
+## Continuation coordination
+
+When a companion client extension is installed in the same session, the two extensions coordinate over the shared extension event bus with a small private protocol (`src/coordination.ts`):
+
+- the client extension claims **continuation ownership** when its audit loop is armed (synchronous request/reply, `respond` callback as transport)
+- while the claim is held, pi-token-budget **suppresses its own generic post-rollover continuation message** for a rollover that started under that owner, so the client can resume with its precise repair instruction instead
+- one active owner per session; the same owner re-claims idempotently; claims from other sessions are rejected with `session_mismatch`
+- the claim never changes budget thresholds, the checkpoint fence, notes, or compaction behavior — only the generic continuation is gated
+
+Guarantees: payloads are validated by strict shape guards (including rejection of unknown claim fields); there is deliberately **no version field** — both extensions are updated atomically; if either side is absent or disabled, everything degrades to the previous single-extension behavior. A non-aborted rollover failure clears transient rollover state before publishing a final snapshot with the real phase (`ready` or `checkpoint_required`) and the error, so continuation owners never remain stuck on a stale `rolling_over` snapshot. An extension-cancelled compact attempt (`aborted: true`) preserves the hard/new-context rollover intent for the next settled boundary. Host-side state is pure and bus-injected, so the protocol is fully covered by `npm run coordination && npm run coordination-integration`.
+
 ## Known limitations
 
 - Models with very small contexts (<16k) hit the fallback path frequently — degraded experience, still correct
@@ -167,7 +178,7 @@ If you'd rather keep this extension out of subagents, declare `extensions: []` i
 ```bash
 npm install        # Install pinned pi contracts, typebox, and TypeScript test dependencies
 npm run typecheck  # strict tsc against the installed pi package types
-npm test           # smoke + queue-aware integration + real pi-agent-core contract
+npm test           # smoke + queue-aware integration + pi-agent-core contract + coordination (unit + dual-extension)
 ```
 
 Implementation details and design invariants live in the source comments and `src/tools/README.md`.

@@ -22,6 +22,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, reminderThreshold, resolveForModel, type ConfigBundle, type TokenBudgetConfig } from "./config.ts";
+import { CoordinationHost } from "./coordination.ts";
 import { HistoryStore } from "./stores/history-store.ts";
 import { NotesStore } from "./stores/notes-store.ts";
 import {
@@ -114,6 +115,26 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	let checkpointFenceActive = false;
 	let checkpointSaved = false;
 	let checkpointWriteClaimed = false;
+	/** Session id for coordination payloads; set on session_start. */
+	let currentSessionId = "pending-session";
+
+	// ---------------------------------------------------------------------
+	// Continuation-ownership coordination (private protocol, see coordination.ts)
+	// ---------------------------------------------------------------------
+	const coordination = new CoordinationHost(
+		pi.events,
+		() => currentSessionId,
+		() => state.currentWindowId,
+		() => ({
+			enabled: bundle.defaults.enabled,
+			pendingWindow,
+			compactionInFlight,
+			checkpointRequired: (state.fallbackActive || checkpointFenceActive) && !checkpointSaved,
+			pendingNewContext: state.pendingNewContext,
+			rolloverRequested,
+		}),
+	);
+	coordination.listen();
 
 	function persist(): void {
 		if (sessionDir) saveState(sessionDir, state);
@@ -123,6 +144,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		state = { ...state, pendingNewContext: true };
 		rolloverRequested = true;
 		persist();
+		coordination.publish();
 	}
 
 	function currentBranch(ctx: ExtensionContext): LooseEntry[] {
@@ -280,6 +302,10 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	}
 
 	function buildRollover(event: BeforeCompactEventLike) {
+		// Latch the continuation owner at rollover start: this rollover's
+		// generic-continuation suppression depends only on this snapshot; a
+		// later release only affects future rollovers.
+		coordination.latchRolloverOwner();
 		// Autonomous continuation belongs to an existing model/fallback request,
 		// not to the manual/overflow reason that happened to commit it.
 		continueAfterRollover = state.pendingNewContext || state.fallbackActive;
@@ -292,7 +318,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			windowNumber: pendingWindow.number,
 		};
 		const branch = event.branchEntries as LooseEntry[];
-		return {
+		const rollover = {
 			compaction: {
 				summary: bootstrapText(identity, userRequestLines(branch), editedFileLines(branch)),
 				// Sentinel id that matches no entry: the new window keeps nothing
@@ -301,6 +327,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 				tokensBefore: event.preparation.tokensBefore,
 			},
 		};
+		// pendingWindow is set and the owner latched: publish rolling_over.
+		coordination.publish();
+		return rollover;
 	}
 
 	// ---------------------------------------------------------------------
@@ -325,7 +354,8 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 				if (!notes) throw new Error("session not initialized yet");
 				return notes;
 			},
-			buildHistory: (ctx: ExtensionContext) => new HistoryStore(currentBranch(ctx)),			triggerCompaction: (ctx: ExtensionContext) => {
+			buildHistory: (ctx: ExtensionContext) => new HistoryStore(currentBranch(ctx)),
+			triggerCompaction: (ctx: ExtensionContext) => {
 				startDeferredRollover(ctx);
 			},
 			remainingTokens: (ctx: ExtensionContext) => {
@@ -340,7 +370,14 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	// Session lifecycle
 	// ---------------------------------------------------------------------
 	pi.on("session_start", (_event, ctx) => {
-		if (!bundle.defaults.enabled) return;
+		currentSessionId = ctx.sessionManager.getSessionId();
+		coordination.resetSession();
+		if (!bundle.defaults.enabled) {
+			// Coordination still announces itself so clients can distinguish
+			// "installed but disabled" from "not installed".
+			coordination.publish();
+			return;
+		}
 		sessionDir = ctx.sessionManager.getSessionDir();
 		lastRolloverTimestamp = 0;
 		modelConfigKey = "";
@@ -358,6 +395,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		checkpointSaved = false;
 		checkpointWriteClaimed = false;
 		persist();
+		coordination.publish();
 
 		// First-window guidance (later windows bootstrap via the rollover summary).
 		if (state.windowNumber === 1 && !windowHasGuidance(branch)) {
@@ -399,6 +437,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			checkpointFenceActive = true;
 			checkpointSaved = false;
 			checkpointWriteClaimed = false;
+			coordination.publish();
 			return;
 		}
 		if (msg?.role !== "assistant" || msg.stopReason === "aborted") return;
@@ -432,6 +471,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 				persist();
 				sendFallback(ctx);
 				rolloverRequested = true; // consumed at agent_settled
+				coordination.publish();
 				return;
 			}
 		}
@@ -471,6 +511,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			if (!state.fallbackActive || !state.fallbackDelivered) {
 				state = { ...state, reminderDelivered: true, fallbackDelivered: true, fallbackActive: true };
 				persist();
+				coordination.publish();
 			}
 			return buildRollover(compactEvent);
 		}
@@ -499,6 +540,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 
 		state = { ...state, reminderDelivered: true, fallbackDelivered: true, fallbackActive: true };
 		persist();
+		coordination.publish();
 		sendFallback(ctx);
 		return { cancel: true };
 	});
@@ -509,16 +551,8 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		if (typeof summary !== "string" || !summary.includes(BOOTSTRAP_MARKER) || !pendingWindow) return;
 		const entryTs = (event.compactionEntry as { timestamp?: string }).timestamp;
 		if (entryTs) lastRolloverTimestamp = new Date(entryTs).getTime() || 0;
-		if (continueAfterRollover) {
-			continueAfterRollover = false;
-			// Compaction normally commits between turns. If pi completes it while
-			// still streaming, preserve steering delivery instead of follow-up.
-			pi.sendMessage(
-				{ customType: CUSTOM_TYPE_CONTINUE, content: continuationMessage(state.windowNumber), display: true, details: undefined },
-				ctx.isIdle() ? { triggerTurn: true } : { triggerTurn: true, deliverAs: "steer" },
-			);
-		}
 		const previous = state.windowNumber;
+		const previousWindowId = state.currentWindowId;
 		state = commitRollover(state, pendingWindow);
 		pendingWindow = null;
 		rolloverRequested = false;
@@ -527,6 +561,22 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		checkpointSaved = false;
 		checkpointWriteClaimed = false;
 		persist();
+		// Commit and persist first, then announce readiness, and only then
+		// decide the continuation: the owner (if latched) resumes instead of
+		// the generic continuation message.
+		coordination.publish({ previousWindowId });
+		if (continueAfterRollover) {
+			continueAfterRollover = false;
+			if (!coordination.suppressGenericContinuation()) {
+				// Compaction normally commits between turns. If pi completes it while
+				// still streaming, preserve steering delivery instead of follow-up.
+				pi.sendMessage(
+					{ customType: CUSTOM_TYPE_CONTINUE, content: continuationMessage(state.windowNumber), display: true, details: undefined },
+					ctx.isIdle() ? { triggerTurn: true } : { triggerTurn: true, deliverAs: "steer" },
+				);
+			}
+		}
+		coordination.clearRolloverOwnerLatch();
 		console.log(`pi-token-budget: context window reset ${previous} -> ${state.windowNumber} (id ${state.currentWindowId})`);
 	});
 
@@ -535,11 +585,23 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		pendingWindow = null;
 		compactionInFlight = false;
 		continueAfterRollover = false;
+		// A session_before_compact { cancel: true } result is reported through
+		// this event with aborted=true. It only rejects that compact attempt;
+		// the hard/new-context rollover intent must survive for agent_settled.
+		if (!event.aborted) {
+			rolloverRequested = false;
+			state = { ...state, pendingNewContext: false };
+		}
 		checkpointSaved = false;
 		checkpointWriteClaimed = false;
+		coordination.clearRolloverOwnerLatch();
+		persist();
+		const errorMessage = event.errorMessage;
+		coordination.publish(errorMessage !== undefined ? { error: errorMessage } : {});
 		// Keep checkpointFenceActive armed: a failed rollover can be retried
 		// after rewriting the checkpoint if needed.
-		// aborted=true is expected: our one-shot threshold cancel.
+		// aborted=true is expected for our one-shot threshold cancel; the
+		// rollover request remains armed for the next settled boundary.
 		// On a real rollover failure, fallbackActive stays set so the next
 		// threshold crossing retries the rollover.
 	});
@@ -552,14 +614,12 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		if (compactionInFlight || !ctx.isIdle()) return;
 		compactionInFlight = true;
 		rolloverRequested = false;
+		coordination.publish();
 		ctx.compact({
 			onComplete: () => {
 				compactionInFlight = false;
 			},
 			onError: (err: Error) => {
-				compactionInFlight = false;
-				state = { ...state, pendingNewContext: false };
-				persist();
 				ctx.ui.notify(`pi-token-budget: rollover failed: ${err.message}`, "warning");
 			},
 		});
@@ -619,5 +679,10 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		checkpointFenceActive = false;
 		checkpointSaved = false;
 		checkpointWriteClaimed = false;
+		// Clear the active claim so a stale owner cannot block later
+		// continuations after reload/replacement. Surviving runs re-claim
+		// (idempotently) when they recover.
+		coordination.clearOwner();
+		coordination.clearRolloverOwnerLatch();
 	});
 }
