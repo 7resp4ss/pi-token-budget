@@ -1,4 +1,11 @@
-/** Locks the pi-agent-core 0.84.4 steering/follow-up queue contract. */
+/**
+ * Locks the pi-agent-core steering/follow-up queue contract.
+ *
+ * pi-agent-core removed AgentContext.systemPrompt (the system prompt is now
+ * the leading system message in `messages`), while pinned 0.84.4 still
+ * requires it. CI typechecks this file against both, so the context literal
+ * is built conditionally: each leg checks it against its own contract.
+ */
 
 import * as assert from "node:assert/strict";
 import {
@@ -100,10 +107,13 @@ const followUp = { role: "user", content: [{ type: "text", text: "FOLLOWUP-CONTR
 let steeringDelivered = false;
 let followUpDelivered = false;
 
+type LegacyContextExtras = "systemPrompt" extends keyof AgentContext ? { systemPrompt: string } : object;
+const legacyContextExtras = { systemPrompt: "contract" } as LegacyContextExtras;
+
 const context: AgentContext = {
-	systemPrompt: "contract",
 	messages: [],
 	tools: [noopTool],
+	...legacyContextExtras,
 };
 
 await runAgentLoop(
