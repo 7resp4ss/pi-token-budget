@@ -25,6 +25,7 @@
 - `execute()` 只置位 `pendingNewContext` 标记并立即返回确认文案——**绝不打断当前响应**
 - 真正换窗在 turn 边界（`agent_settled` → `ctx.compact()` → `session_before_compact` 拦截）或 pi 自动压缩触发时
 - 换窗提交后由编排层注入续跑消息，任务在新窗口自动继续
+- **确认文案携带本窗口的 recent-item 索引**（同一份 25×120 参数、与 reminder 同源）：主动换窗是唯一一条 reminder/fallback 都没触发过的路径，模型从未见过 item id，notes 里就没有锚点。该文本是**旧窗口**的 tool result，换窗哨兵连同旧 trace 一起丢弃 → 新窗口零成本，而模型当场还有行动能力（此路径无 fence，可再 `notes.append` 抄 id）。
 
 ## notes
 
@@ -53,6 +54,8 @@
 | `search_contents` | `query`†, `window_id?`, `role?`, `limit?`, `recent_first?` | 匹配条目 + 定位预览 |
 
 † 必填。
+
+**recent-item 索引过滤**：编排层构造 reminder/fallback/new_context 所附的有界索引时，走 `listItems({ excludeCustomTypePrefixes: ["pi-token-budget:"] })`——本插件自己的 guidance/reminder/fallback/continue 条目是簿记噪音、不是任务对话，不过滤会吃掉这 25 个槽位。其他扩展的 custom 消息（`role: "custom"`、前缀不匹配）仍然保留。`search_contents` 不过滤：按 id 找回一条簿记消息是合法需求。
 
 **防爆炸保证**：参数级分页（字符 offset/limit、条数 limit）+ 输出统一截断（`maxToolOutputChars`）——任何操作都无法返回无界内容。
 

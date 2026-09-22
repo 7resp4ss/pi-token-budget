@@ -219,10 +219,21 @@ export class HistoryStore {
 		limit?: number;
 		recentFirst?: boolean;
 		previewChars: number;
+		/**
+		 * Drop `custom_message` entries whose `customType` starts with any of these
+		 * prefixes. Extension bookkeeping messages (budget reminders, exhaustion
+		 * fallbacks, continuations) are not task conversation: left unfiltered they
+		 * consume slots from bounded recent-item indexes with self-referential noise.
+		 */
+		excludeCustomTypePrefixes?: string[];
 	}): Array<{ itemId: string; windowId: string; role: string; preview: string; chars: number }> {
 		let selected = this.items;
 		if (opts.windowId) selected = selected.filter((i) => i.windowId === opts.windowId);
 		if (opts.role) selected = selected.filter((i) => i.role === opts.role);
+		const excluded = opts.excludeCustomTypePrefixes;
+		if (excluded && excluded.length > 0) {
+			selected = selected.filter((i) => !startsWithAny(i.entry.customType, excluded));
+		}
 		const ordered = opts.recentFirst ? [...selected].reverse() : selected;
 		const limit = opts.limit ? Math.max(1, opts.limit) : ordered.length;
 		return ordered.slice(0, limit).map((i) => {
@@ -272,6 +283,11 @@ export class HistoryStore {
 export function truncate(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	return `${text.slice(0, Math.max(1, maxChars))}…[truncated, ${text.length} chars total]`;
+}
+
+function startsWithAny(value: string | undefined, prefixes: string[]): boolean {
+	if (value === undefined) return false;
+	return prefixes.some((prefix) => value.startsWith(prefix));
 }
 
 function previewAround(text: string, query: string, maxChars: number): string {

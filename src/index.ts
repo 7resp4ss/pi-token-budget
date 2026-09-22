@@ -30,6 +30,7 @@ import {
 	CUSTOM_TYPE_CONTEXT_WINDOW,
 	CUSTOM_TYPE_CONTINUE,
 	CUSTOM_TYPE_FALLBACK,
+	CUSTOM_TYPE_PREFIX,
 	CUSTOM_TYPE_REMINDER,
 	bootstrapText,
 	continuationMessage,
@@ -211,6 +212,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			recentFirst: true,
 			limit: 25,
 			previewChars: 120,
+			// Own reminders/fallbacks/continuations are bookkeeping, not task
+			// conversation: they must not eat slots from this bounded index.
+			excludeCustomTypePrefixes: [CUSTOM_TYPE_PREFIX],
 		});
 		return items
 			.reverse() // chronological order for readability
@@ -355,6 +359,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 				return notes;
 			},
 			buildHistory: (ctx: ExtensionContext) => new HistoryStore(currentBranch(ctx)),
+			recentItemLines: (ctx: ExtensionContext) => recentItemLines(ctx),
 			triggerCompaction: (ctx: ExtensionContext) => {
 				startDeferredRollover(ctx);
 			},

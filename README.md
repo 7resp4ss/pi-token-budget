@@ -72,11 +72,19 @@ Rollover carries zero summary: the new window keeps none of the old conversation
 | Tool | Description |
 |---|---|
 | `get_context_remaining` | Real-time remaining tokens (pull channel) + current window id (`w1`, `w2`, …) |
-| `new_context` | Declares a rollover (no parameters); executed after the turn ends, environment state is unaffected |
+| `new_context` | Declares a rollover (no parameters); executed after the turn ends, environment state is unaffected. Its confirmation returns this window's bounded recent-item index as copyable anchors (see below) |
 | `notes` | Virtual-path filesystem: `read/write/append/delete/search/list`, survives across windows, ≤1MB per file; read supports line/char dual pagination; soft warnings on bloat |
 | `history` | Read-only index: `list_windows/list_items/read_item/search_contents`, char-level pagination |
 
 All tool output is bounded (char-level pagination + total truncation), so reading history or notes can never blow up the fresh window by accident.
+
+### Where item ids are handed over
+
+The reminder and the exhaustion fallback both append a bounded recent-item index (`id — role — preview`, 25 × 120 chars) so the model can record anchors in its checkpoint. Proactive `new_context` is the one rollover path where neither ever fired: the model crosses the boundary without ever having seen an id list, so its notes name goals and decisions but carry no anchors, and the fresh window has to rediscover items by guessing search terms.
+
+`new_context` closes that gap by returning the same index in its own confirmation text. That text is a tool result **of the old window**, so the rollover sentinel discards it along with the rest of the trace: the fresh window pays zero tokens, while the model — still inside a path with no fence — can `notes.append` the ids before the turn ends. Ids cross the boundary inside model-curated notes, never as a system-pushed trace dump.
+
+That index is built with the plugin's own bookkeeping messages (`guidance`/`reminder`/`fallback`/`continue`) filtered out: they are not task conversation and would otherwise crowd out real entries from a 25-slot budget.
 
 ## Install
 

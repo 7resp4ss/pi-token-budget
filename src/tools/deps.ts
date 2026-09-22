@@ -34,6 +34,13 @@ export interface ToolDeps {
 	getNotes(): NotesStore;
 	/** History index built from the live session branch. */
 	buildHistory(ctx: ExtensionContext): HistoryStore;
+	/**
+	 * Bounded recent-item index (id — role — preview) of the CURRENT window,
+	 * with the plugin's own bookkeeping messages filtered out. Used by the
+	 * reminder/fallback prompts and by the new_context confirmation so ids can be
+	 * copied into notes while the conversation is still visible.
+	 */
+	recentItemLines(ctx: ExtensionContext): string[];
 	/** Fire-and-forget rollover via pi's compaction pipeline (turn boundary only). */
 	triggerCompaction(ctx: ExtensionContext): void;
 	/** Remaining tokens from live context usage, or null when unknown. */

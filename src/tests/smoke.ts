@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { DEFAULTS, loadConfig, reminderThreshold, resolveForModel, type ConfigBundle } from "../config.ts";
 import { HistoryStore } from "../stores/history-store.ts";
 import { NotesStore } from "../stores/notes-store.ts";
-import { BOOTSTRAP_MARKER, bootstrapText, guidanceMessage, reminderMessage } from "../prompts.ts";
+import { BOOTSTRAP_MARKER, NEW_CONTEXT_CONFIRMATION, bootstrapText, guidanceMessage, newContextConfirmation, reminderMessage } from "../prompts.ts";
 import { notesBloatWarnings } from "../tools/deps.ts";
 import { commitRollover, freshState, inferFromBranch, loadState, saveState, stateFilePath } from "../state.ts";
 
@@ -184,6 +184,16 @@ assert.ok(reminderMessage("w-c", 1234).includes("verbatim"), "reminder requires 
 assert.ok(reminderMessage("w-c", 1234).includes("only 1234 tokens remain"));
 assert.ok(reminderMessage("w-c", 1234).includes('source_context_window_id="w-c"'));
 assert.ok(reminderMessage("w-c", 1234).includes("clean up old notes"), "generic cleanup advice when no bloat");
+
+// The new_context confirmation carries the recent-item index in the OLD window
+// and degrades to the plain sentence when the branch has nothing to index.
+assert.equal(newContextConfirmation([]), NEW_CONTEXT_CONFIRMATION, "empty index adds no text");
+const ncText = newContextConfirmation(["a1 — user — fix the parser panic", "b2 — assistant — [tool_call edit] {\"path\":\"src/p.ts\"}"]);
+assert.ok(ncText.startsWith(NEW_CONTEXT_CONFIRMATION), "base confirmation is preserved");
+assert.ok(ncText.includes("a1 — user — fix the parser panic"), "ids are copyable from the tool result");
+assert.ok(ncText.includes("b2 — assistant — [tool_call edit]"), "tool-call anchors are included");
+assert.ok(ncText.includes("NOT carried into the new window"), "states plainly that this text does not cross the boundary");
+assert.ok(!NEW_CONTEXT_CONFIRMATION.includes("Recent items"), "the plain confirmation carries no index");
 const bloatedReminder = reminderMessage("w-c", 1234, [], ['⚠ note "chonky.md" is 80000 bytes (> 62500)']);
 assert.ok(bloatedReminder.includes("Notes bloat"));
 assert.ok(bloatedReminder.includes("chonky.md"));
@@ -417,6 +427,36 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 	assert.ok(w1);
 	assert.equal(w1.itemCount, 3, "empty-render entries never enter window counts");
 	assert.equal(edgeStore.readItem("x8", 0, 10).windowId, "w2", "compaction opens a new window even with empty summary");
+}
+
+// Extension bookkeeping messages must not consume slots from a bounded
+// recent-item index: their previews are self-referential noise ("save your
+// notes"), never task conversation. Entry e5 above has no customType and is
+// therefore a foreign custom message that stays.
+{
+	const noisyBranch = [
+		{ id: "n1", type: "message", message: { role: "user", content: [{ type: "text", text: "real request" }] } },
+		{ id: "n2", type: "custom_message", customType: "pi-token-budget:reminder", content: "budget nudge" },
+		{ id: "n3", type: "custom_message", customType: "pi-token-budget:fallback", content: "checkpoint now" },
+		{ id: "n4", type: "custom_message", customType: "pi-token-budget:continue", content: "keep going" },
+		{ id: "n5", type: "custom_message", customType: "reframe:audit", content: "another extension's message" },
+		{ id: "n6", type: "message", message: { role: "assistant", content: [{ type: "text", text: "real answer" }] } },
+	];
+	const noisy = new HistoryStore(noisyBranch as never);
+	assert.deepEqual(
+		noisy.listItems({ previewChars: 40, excludeCustomTypePrefixes: ["pi-token-budget:"] }).map((i) => i.itemId),
+		["n1", "n5", "n6"],
+	);
+	// The filter runs before the limit: excluded entries must not displace kept ones.
+	assert.deepEqual(
+		noisy
+			.listItems({ previewChars: 40, recentFirst: true, limit: 2, excludeCustomTypePrefixes: ["pi-token-budget:"] })
+			.map((i) => i.itemId),
+		["n6", "n5"],
+	);
+	assert.equal(noisy.listItems({ previewChars: 40 }).length, 6, "without the option nothing is filtered");
+	// search_contents stays unfiltered: recovering a plugin message by id is valid.
+	assert.deepEqual(noisy.searchContents("checkpoint", { previewChars: 40 }).map((i) => i.itemId), ["n3"]);
 }
 
 // Laziness holds at scale: a single read_item renders exactly one entry

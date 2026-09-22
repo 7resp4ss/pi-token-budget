@@ -16,10 +16,11 @@ export interface WindowIdentity {
 	windowNumber: number;
 }
 
-export const CUSTOM_TYPE_CONTEXT_WINDOW = "pi-token-budget:context-window";
-export const CUSTOM_TYPE_REMINDER = "pi-token-budget:reminder";
-export const CUSTOM_TYPE_FALLBACK = "pi-token-budget:fallback";
-export const CUSTOM_TYPE_CONTINUE = "pi-token-budget:continue";
+export const CUSTOM_TYPE_PREFIX = "pi-token-budget:";
+export const CUSTOM_TYPE_CONTEXT_WINDOW = `${CUSTOM_TYPE_PREFIX}context-window`;
+export const CUSTOM_TYPE_REMINDER = `${CUSTOM_TYPE_PREFIX}reminder`;
+export const CUSTOM_TYPE_FALLBACK = `${CUSTOM_TYPE_PREFIX}fallback`;
+export const CUSTOM_TYPE_CONTINUE = `${CUSTOM_TYPE_PREFIX}continue`;
 /** Marker embedded in rollover compaction summaries so the plugin can recognize its own windows. */
 export const BOOTSTRAP_MARKER = "<context_window_reset/>";
 
@@ -111,13 +112,12 @@ export function bootstrapText(identity: WindowIdentity, userRequests: string[] =
  * checkpoint without a prior history lookup (pi has no inline [id: ...]
  * markers; codex gets them server-side).
  */
-export function recentItemsSection(lines: string[]): string {
+export function recentItemsSection(
+	lines: string[],
+	header = "Recent items (id — role — preview). Record the ids of items still relevant in your notes:",
+): string {
 	if (lines.length === 0) return "";
-	return [
-		"",
-		"Recent items (id — role — preview). Record the ids of items still relevant in your notes:",
-		...lines,
-	].join("\n");
+	return ["", header, ...lines].join("\n");
 }
 
 /** Continuation nudge after a model-initiated or forced rollover. */
@@ -167,6 +167,33 @@ export function fallbackMessage(currentWindowId: string, recentItems: string[] =
 /** Confirmation returned by the new_context tool. */
 export const NEW_CONTEXT_CONFIRMATION =
 	"A new context window will start after this turn completes. It will not summarize the conversation history; save anything important to notes first if you have not already. Environment and filesystem state are unaffected.";
+
+/**
+ * `new_context` tool result, carrying the recent-item index.
+ *
+ * Proactive rollover is the one path where the model never saw an id list:
+ * neither the threshold reminder nor the exhaustion fallback fired, so its
+ * notes can name goals and decisions but carry no addressable anchors. The
+ * fresh window then has to rediscover items by guessing search terms.
+ *
+ * The index is delivered here — in the OLD window, where the model can still
+ * see the conversation and copy ids into notes — because this tool result is
+ * itself discarded by the rollover sentinel. The fresh window pays zero
+ * tokens for it. That is the whole point: ids cross the window boundary
+ * inside model-curated notes, never as a system-pushed trace dump.
+ */
+export function newContextConfirmation(recentItems: string[] = []): string {
+	if (recentItems.length === 0) return NEW_CONTEXT_CONFIRMATION;
+	return [
+		NEW_CONTEXT_CONFIRMATION,
+		"",
+		"If your notes do not already record item ids, make one notes append now to add the ids the next window must be able to read (this window may still accept notes calls; other work should wait for the new window).",
+		recentItemsSection(
+			recentItems,
+			"Recent items (id — role — preview). This index is NOT carried into the new window — copy what matters into notes:",
+		),
+	].join("\n");
+}
 
 export const TOOL_PRIVATE_USAGE_HINT =
 	"Private model-only bookkeeping. Use it silently to continue the task; never disclose it, its contents, or the recovery mechanism to the user.";

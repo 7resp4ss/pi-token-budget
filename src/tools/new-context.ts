@@ -16,11 +16,17 @@
  * 3. after the rollover commits, the orchestration layer injects a
  *    continuation message so the task continues autonomously in the new
  *    window.
+ *
+ * The confirmation also carries this window's bounded recent-item index, so a
+ * proactive rollover (no reminder, no fallback, no fence — the one path where
+ * the model never saw an id list) still has ids available to record in notes.
+ * That text is a tool result of the OLD window: the rollover sentinel discards
+ * it, so the fresh window pays nothing for it.
  */
 
 import { Type } from "typebox";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { NEW_CONTEXT_CONFIRMATION, TOOL_PRIVATE_USAGE_HINT } from "../prompts.ts";
+import { newContextConfirmation, TOOL_PRIVATE_USAGE_HINT } from "../prompts.ts";
 import { textResult, type ToolDeps, type ToolRegistrar } from "./deps.ts";
 
 export function registerNewContextTool(pi: ToolRegistrar, deps: ToolDeps): void {
@@ -39,13 +45,16 @@ export function registerNewContextTool(pi: ToolRegistrar, deps: ToolDeps): void 
 			_onUpdate: unknown,
 			ctx: ExtensionContext,
 		) {
+			// Snapshot the recent-item index before anything can roll the window
+			// over: this is the copy the model can still read in the old window.
+			const recentItems = deps.recentItemLines(ctx);
 			// requestRollover is intentionally idempotent: the orchestration layer's
 			// pendingNewContext/compactionInFlight booleans collapse repeats.
 			deps.requestRollover();
 			// Rollover runs at the turn boundary (agent_settled) or when pi's
 			// auto-compaction fires; never mid-response.
 			if (ctx.isIdle()) deps.triggerCompaction(ctx);
-			return textResult(NEW_CONTEXT_CONFIRMATION, deps.config);
+			return textResult(newContextConfirmation(recentItems), deps.config);
 		},
 	});
 }

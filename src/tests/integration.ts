@@ -629,6 +629,51 @@ for (const reason of ["manual", "overflow"] as const) {
 	h.cleanup();
 }
 
+// A proactive new_context hands the model copyable item ids while the old
+// window can still act on them — and the fresh window pays nothing for it.
+{
+	const h = createHarness("new-context-anchors");
+	h.setBranch([
+		{ id: "u-1", type: "message", message: { role: "user", content: [{ type: "text", text: "fix the parser panic" }] } },
+		{ id: "a-1", type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "src/p.ts" } }] } },
+		{ id: "g-1", type: "custom_message", customType: CUSTOM_TYPE_CONTEXT_WINDOW, content: "window guidance", display: false },
+		{ id: "f-1", type: "custom_message", customType: "reframe:audit", content: "a foreign extension message", display: false },
+	]);
+	h.setIdle(false);
+	const confirmation = toolText(await h.tools.get("new_context")!.execute("nc-anchors", {}, undefined, undefined, h.ctx));
+	assert.ok(confirmation.includes("u-1 — user — fix the parser panic"), "user request ids are anchored");
+	assert.ok(confirmation.includes("a-1 — assistant — [tool_call edit]"), "tool-call anchors are copyable");
+	assert.ok(confirmation.includes("f-1 — custom —"), "only this plugin's own messages are filtered");
+	assert.ok(!confirmation.includes("g-1"), "the plugin's bookkeeping must not eat an index slot");
+
+	const result = h.threshold("manual", 160_000);
+	assert.ok(result.compaction);
+	assert.ok(!result.compaction!.summary.includes("[tool_call edit]"), "the anchor index stays in the old window");
+	assert.ok(!result.compaction!.summary.includes("Recent items"), "the bootstrap gains no recent-items section");
+	assert.ok(result.compaction!.summary.includes("fix the parser panic"), "the user-request index still crosses over");
+	h.commit(result.compaction!);
+	assert.equal(h.sent.at(-1)?.customType, CUSTOM_TYPE_CONTINUE);
+	h.cleanup();
+}
+
+// The threshold reminder uses the same filtered index, so a prior window's
+// guidance/reminder entries cannot crowd out real conversation.
+{
+	const h = createHarness("reminder-index-filtered");
+	h.setBranch([
+		{ id: "u-9", type: "message", message: { role: "user", content: [{ type: "text", text: "audit the fence" }] } },
+		{ id: "g-9", type: "custom_message", customType: CUSTOM_TYPE_CONTEXT_WINDOW, content: "window guidance", display: false },
+	]);
+	h.setUsage(150_000);
+	h.setIdle(false);
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+	const reminder = h.steering[0];
+	assert.equal(reminder?.customType, CUSTOM_TYPE_REMINDER);
+	assert.ok(reminder.content.includes("u-9 — user — audit the fence"), "reminder carries the anchor ids");
+	assert.ok(!reminder.content.includes("g-9"), "guidance is not conversation");
+	h.cleanup();
+}
+
 // A fallback-armed rollover keeps continuation as steer if compaction commits
 // while pi still reports streaming.
 {
