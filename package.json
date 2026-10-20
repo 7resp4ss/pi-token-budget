@@ -1,7 +1,7 @@
 {
 	"name": "pi-token-budget",
 	"version": "1.1.8",
-	"description": "No-summary context-window rollover for Pi with durable notes checkpoints, history recovery, and a post-fallback tool-call fence.",
+	"description": "No-summary context-window rollover for Pi with durable notes checkpoints, history recovery, and a checkpoint tool-call fence.",
 	"type": "module",
 	"license": "MIT",
 	"keywords": [

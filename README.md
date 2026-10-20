@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-token-budget?style=flat-square)](https://www.npmjs.com/package/pi-token-budget) [![license](https://img.shields.io/npm/l/pi-token-budget?style=flat-square)](LICENSE)
 
-Token-budget context window management for [Pi](https://github.com/earendil-works/pi): **no-summary context rollover** with model-authored notes checkpoints, read-only history recovery, and a post-fallback tool-call fence. It replaces lossy summarization compaction while preserving the current in-flight response. Replaces pi's summarization compaction with the mechanism pioneered by codex's `token_budget` feature (#27488 series).
+Token-budget context window management for [Pi](https://github.com/earendil-works/pi): **no-summary context rollover** with model-authored notes checkpoints, read-only history recovery, and a checkpoint tool-call fence. It replaces lossy summarization compaction while preserving the current in-flight response. Replaces pi's summarization compaction with the mechanism pioneered by codex's `token_budget` feature (#27488 series).
 
 ## At a glance
 
@@ -11,7 +11,7 @@ Long-running Pi sessions can hit a nearly exhausted context window while the mod
 `pi-token-budget` turns that boundary into an enforceable checkpoint:
 
 - the fallback is delivered without aborting the current response;
-- once delivered, only one `notes` write/append is admitted;
+- once a fallback or manual checkpoint request is delivered, only one `notes` write/append is admitted;
 - all other tools are blocked at the `tool_call` hook;
 - a successful checkpoint returns `terminate: true` and requests rollover automatically;
 - the next window starts with a fresh bootstrap and recovers the task through notes and history.
@@ -53,13 +53,25 @@ New window = bootstrap block (window identity + recovery protocol
      re-read on demand via history by item id
 ```
 
-After the fallback reaches the branch, the checkpoint fence closes the tool surface until the checkpoint is saved:
+After the fallback or a user-requested checkpoint reaches the branch, the checkpoint fence closes the tool surface until the checkpoint is saved:
 
 ```text
-fallback delivered ──► notes.write / notes.append (exactly once)
-                  └──► other tool calls blocked
+fallback/manual checkpoint delivered ──► notes.write / notes.append (exactly once)
+                               └───────► other tool calls blocked
 checkpoint saved ──► terminate tool batch ──► deferred rollover
 ```
+
+### Manual `/compact`
+
+When Pi has enough history to prepare a compaction, its built-in `/compact` command is treated as an explicit save-and-rollover request, independent of the remaining-context threshold:
+
+1. The first native compaction attempt is cancelled and a dedicated checkpoint turn starts with recent item ids attached.
+2. The model may make exactly one successful `notes.write` or `notes.append`; it does not need to call `new_context`.
+3. A successful write terminates that tool batch, retries compaction automatically, and resumes unfinished work in the fresh window. If the checkpoint records no unfinished work, the continuation waits for the user.
+
+Pressing Esc during the checkpoint turn cancels this manual request and stale checkpoint instructions are filtered from later model contexts. If the note succeeds but compaction itself fails, another `/compact` reuses that checkpoint; any normal user message invalidates it and reopens ordinary tools. Repeated `/compact` commands before prompt delivery collapse into one request. Pi currently renders the deliberately cancelled first attempt as `Compaction cancelled` before the checkpoint turn appears; this is a host-level UI consequence of intercepting the built-in command.
+
+An actual context overflow remains an emergency direct rollover because there may no longer be enough room for another model-authored checkpoint.
 
 ### Why this exists
 
@@ -189,7 +201,7 @@ When a companion client extension is installed in the same session, the two exte
 - one active owner per session; the same owner re-claims idempotently; claims from other sessions are rejected with `session_mismatch`
 - the claim never changes budget thresholds, the checkpoint fence, notes, or compaction behavior — only the generic continuation is gated
 
-Guarantees: payloads are validated by strict shape guards (including rejection of unknown claim fields); there is deliberately **no version field** — both extensions are updated atomically; if either side is absent or disabled, everything degrades to the previous single-extension behavior. A non-aborted rollover failure clears transient rollover state before publishing a final snapshot with the real phase (`ready` or `checkpoint_required`) and the error, so continuation owners never remain stuck on a stale `rolling_over` snapshot. An extension-cancelled compact attempt (`aborted: true`) preserves the hard/new-context rollover intent for the next settled boundary. Host-side state is pure and bus-injected, so the protocol is fully covered by `npm run coordination && npm run coordination-integration`.
+Guarantees: payloads are validated by strict shape guards (including rejection of unknown claim fields); there is deliberately **no version field** — both extensions are updated atomically; if either side is absent or disabled, everything degrades to the previous single-extension behavior. A non-aborted rollover failure clears transient rollover state before publishing the real phase and error; a failed manual rollover may instead remain `rollover_pending` when its checkpoint is still reusable. An extension-cancelled automatic compact attempt preserves the hard/new-context rollover intent for the next settled boundary, while Esc on a manual rollover does not retry behind the user. Host-side state is pure and bus-injected, so the protocol is fully covered by `npm run coordination && npm run coordination-integration`.
 
 ## Known limitations
 

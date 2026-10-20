@@ -7,6 +7,7 @@
  * - one-shot threshold reminder and exhaustion fallback per window
  * - notes: model-authored checkpoints that survive rollovers
  * - history: read-only, bounded random access to prior windows
+ * - checkpoint tool-call fence after fallback or user /compact requests
  *
  * Design invariants:
  * 1. The in-flight response is never interrupted: injections and rollovers
@@ -31,12 +32,14 @@ import {
 	CUSTOM_TYPE_CONTEXT_WINDOW,
 	CUSTOM_TYPE_CONTINUE,
 	CUSTOM_TYPE_FALLBACK,
+	CUSTOM_TYPE_MANUAL_CHECKPOINT,
 	CUSTOM_TYPE_REMINDER,
 	HISTORY_TOOL_MIGRATION_HINT,
 	bootstrapText,
 	continuationMessage,
 	fallbackMessage,
 	guidanceMessage,
+	manualCheckpointMessage,
 	reminderMessage,
 } from "./prompts.ts";
 import {
@@ -66,6 +69,21 @@ type BudgetMessageKind = "reminder" | "fallback";
 interface BudgetMessageDetails {
 	windowId: string;
 	kind: BudgetMessageKind;
+}
+
+type ManualCheckpointPhase = "awaiting" | "saved" | "compacting";
+
+interface ManualCheckpointRequest {
+	requestId: string;
+	windowId: string;
+	phase: ManualCheckpointPhase;
+	promptQueued: boolean;
+}
+
+interface ManualCheckpointDetails {
+	windowId: string;
+	requestId: string;
+	kind: "manual-checkpoint";
 }
 
 interface BeforeCompactEventLike {
@@ -116,10 +134,12 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	let lastRolloverTimestamp = 0;
 	/** Continue the task in the new window after a model-initiated or forced rollover. */
 	let continueAfterRollover = false;
-	/** Post-fallback checkpoint fence: only one notes write/append may pass. */
+	/** Checkpoint fence: only one notes write/append may pass. */
 	let checkpointFenceActive = false;
 	let checkpointSaved = false;
 	let checkpointWriteClaimed = false;
+	/** User-initiated /compact choreography for the current window. */
+	let manualCheckpointRequest: ManualCheckpointRequest | null = null;
 	/** One-request compatibility guidance for sessions created with the transient split history tools. */
 	let historyMigrationHintPending = false;
 	/** Session id for coordination payloads; set on session_start. */
@@ -136,9 +156,10 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			enabled: bundle.defaults.enabled,
 			pendingWindow,
 			compactionInFlight,
-			checkpointRequired: (state.fallbackActive || checkpointFenceActive) && !checkpointSaved,
+			checkpointRequired:
+				((state.fallbackActive || checkpointFenceActive) && !checkpointSaved) || manualCheckpointRequest?.phase === "awaiting",
 			pendingNewContext: state.pendingNewContext,
-			rolloverRequested,
+			rolloverRequested: rolloverRequested || manualCheckpointRequest?.phase === "saved",
 		}),
 	);
 	coordination.listen();
@@ -210,6 +231,52 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			true,
 			"fallback",
 		);
+	}
+
+	function isManualCheckpointDetails(value: unknown): value is ManualCheckpointDetails {
+		if (!value || typeof value !== "object") return false;
+		const details = value as Partial<ManualCheckpointDetails>;
+		return details.kind === "manual-checkpoint" && typeof details.windowId === "string" && typeof details.requestId === "string";
+	}
+
+	function newManualCheckpointRequest(): ManualCheckpointRequest {
+		return {
+			requestId: `manual-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`,
+			windowId: state.currentWindowId,
+			phase: "awaiting",
+			promptQueued: false,
+		};
+	}
+
+	function sendManualCheckpoint(ctx: ExtensionContext): void {
+		const request = manualCheckpointRequest;
+		if (!request || request.phase !== "awaiting" || request.promptQueued) return;
+		request.promptQueued = true;
+		const details: ManualCheckpointDetails = {
+			windowId: request.windowId,
+			requestId: request.requestId,
+			kind: "manual-checkpoint",
+		};
+		coordination.publish();
+		pi.sendMessage(
+			{
+				customType: CUSTOM_TYPE_MANUAL_CHECKPOINT,
+				content: manualCheckpointMessage(request.windowId, recentItemLines(ctx)),
+				display: true,
+				details,
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	}
+
+	function cancelManualCheckpoint(): void {
+		manualCheckpointRequest = null;
+		if (!state.fallbackActive) {
+			checkpointFenceActive = false;
+			checkpointSaved = false;
+			checkpointWriteClaimed = false;
+		}
+		coordination.publish();
 	}
 
 	/** Bounded recent-item index (id — role — preview) for checkpoint prompts. */
@@ -332,9 +399,11 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		// generic-continuation suppression depends only on this snapshot; a
 		// later release only affects future rollovers.
 		coordination.latchRolloverOwner();
-		// Autonomous continuation belongs to an existing model/fallback request,
-		// not to the manual/overflow reason that happened to commit it.
-		continueAfterRollover = state.pendingNewContext || state.fallbackActive;
+		// Model-, fallback-, and user-requested rollovers resume automatically.
+		// A bare emergency overflow without one of those intents stays passive.
+		const manualContinuation = manualCheckpointRequest?.windowId === state.currentWindowId;
+		continueAfterRollover = state.pendingNewContext || state.fallbackActive || manualContinuation;
+		if (manualContinuation && manualCheckpointRequest) manualCheckpointRequest.phase = "compacting";
 
 		pendingWindow = { id: windowIdFor(state.windowNumber + 1), number: state.windowNumber + 1 };
 		const identity = {
@@ -374,6 +443,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 				if (!checkpointFenceActive || checkpointSaved) return;
 				checkpointSaved = true;
 				checkpointWriteClaimed = true;
+				if (manualCheckpointRequest?.windowId === state.currentWindowId && manualCheckpointRequest.phase === "awaiting") {
+					manualCheckpointRequest.phase = "saved";
+				}
 				requestRollover();
 			},
 			getNotes: () => {
@@ -428,6 +500,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		rolloverRequested = false;
 		compactionInFlight = false;
 		continueAfterRollover = false;
+		manualCheckpointRequest = null;
 		checkpointFenceActive = currentWindowHasMessage(branch, CUSTOM_TYPE_FALLBACK, state.currentWindowId, "fallback");
 		checkpointSaved = false;
 		checkpointWriteClaimed = false;
@@ -451,16 +524,34 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("context", (event) => {
-		if (!bundle.defaults.enabled || !historyMigrationHintPending) return undefined;
-		historyMigrationHintPending = false;
-		const migrationMessage: AgentMessage = {
-			role: "custom",
-			customType: `${CUSTOM_TYPE_CONTEXT_WINDOW}:history-migration`,
-			content: HISTORY_TOOL_MIGRATION_HINT,
-			display: false,
-			timestamp: Date.now(),
-		};
-		return { messages: [...event.messages, migrationMessage] };
+		if (!bundle.defaults.enabled) return undefined;
+		const request = manualCheckpointRequest;
+		const manualIndexes: number[] = [];
+		for (let index = 0; index < event.messages.length; index++) {
+			const message = event.messages[index] as AgentMessage & { customType?: string; details?: unknown };
+			if (message.role !== "custom" || message.customType !== CUSTOM_TYPE_MANUAL_CHECKPOINT) continue;
+			const details = isManualCheckpointDetails(message.details) ? message.details : undefined;
+			if (request && details?.windowId === request.windowId && details.requestId === request.requestId) manualIndexes.push(index);
+		}
+		const activeManualIndex = manualIndexes.at(-1);
+		let messages = event.messages.filter((message, index) => {
+			const candidate = message as AgentMessage & { customType?: string };
+			return candidate.role !== "custom" || candidate.customType !== CUSTOM_TYPE_MANUAL_CHECKPOINT || index === activeManualIndex;
+		});
+		let changed = messages.length !== event.messages.length;
+		if (historyMigrationHintPending) {
+			historyMigrationHintPending = false;
+			const migrationMessage: AgentMessage = {
+				role: "custom",
+				customType: `${CUSTOM_TYPE_CONTEXT_WINDOW}:history-migration`,
+				content: HISTORY_TOOL_MIGRATION_HINT,
+				display: false,
+				timestamp: Date.now(),
+			};
+			messages = [...messages, migrationMessage];
+			changed = true;
+		}
+		return changed ? { messages } : undefined;
 	});
 
 	// ---------------------------------------------------------------------
@@ -476,18 +567,55 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			stopReason?: string;
 			timestamp?: number;
 			customType?: string;
-			details?: { windowId?: string; kind?: string };
+			details?: unknown;
 		};
+		const budgetDetails = msg.details as Partial<BudgetMessageDetails> | undefined;
 		if (
 			msg?.role === "custom" &&
 			msg.customType === CUSTOM_TYPE_FALLBACK &&
-			(!msg.details?.windowId || msg.details.windowId === state.currentWindowId) &&
-			(!msg.details?.kind || msg.details.kind === "fallback")
+			(!budgetDetails?.windowId || budgetDetails.windowId === state.currentWindowId) &&
+			(!budgetDetails?.kind || budgetDetails.kind === "fallback")
 		) {
 			checkpointFenceActive = true;
 			checkpointSaved = false;
 			checkpointWriteClaimed = false;
 			coordination.publish();
+			return;
+		}
+		if (msg?.role === "custom" && msg.customType === CUSTOM_TYPE_MANUAL_CHECKPOINT && isManualCheckpointDetails(msg.details)) {
+			const request = manualCheckpointRequest;
+			if (request && msg.details.windowId === request.windowId && msg.details.requestId === request.requestId) {
+				request.promptQueued = false;
+				checkpointFenceActive = true;
+				checkpointSaved = false;
+				checkpointWriteClaimed = false;
+				coordination.publish();
+			}
+			return;
+		}
+		if (
+			msg?.role === "user" &&
+			manualCheckpointRequest?.phase === "saved" &&
+			pendingWindow === null &&
+			!compactionInFlight &&
+			!state.pendingNewContext &&
+			!rolloverRequested
+		) {
+			cancelManualCheckpoint();
+			return;
+		}
+		if (msg?.role === "assistant" && msg.stopReason === "aborted" && manualCheckpointRequest) {
+			if (manualCheckpointRequest.phase === "awaiting") {
+				cancelManualCheckpoint();
+			} else if (manualCheckpointRequest.phase === "saved") {
+				// The note is durable, but Esc cancels the automatic rollover. Keep it
+				// reusable for a later explicit /compact unless normal work resumes.
+				rolloverRequested = false;
+				state = { ...state, pendingNewContext: false };
+				manualCheckpointRequest.promptQueued = false;
+				persist();
+				coordination.publish();
+			}
 			return;
 		}
 		if (msg?.role !== "assistant" || msg.stopReason === "aborted") return;
@@ -543,10 +671,41 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		if (!bundle.defaults.enabled) return undefined;
 		const compactEvent = event as BeforeCompactEventLike;
 
-		// Explicit model/user/runtime reasons must never be swallowed by the
-		// threshold checkpoint choreography.
-		if (state.pendingNewContext || compactEvent.reason === "manual" || compactEvent.reason === "overflow") {
+		// Model-requested rollovers and emergency overflows must proceed directly.
+		if (
+			state.pendingNewContext ||
+			(compactionInFlight && (!checkpointFenceActive || checkpointSaved)) ||
+			compactEvent.reason === "overflow"
+		) {
 			return buildRollover(compactEvent);
+		}
+
+		if (compactEvent.reason === "manual") {
+			const currentRequest = manualCheckpointRequest?.windowId === state.currentWindowId ? manualCheckpointRequest : null;
+			if (currentRequest?.phase === "saved" || currentRequest?.phase === "compacting") {
+				return buildRollover(compactEvent);
+			}
+			if (!currentRequest) {
+				manualCheckpointRequest = newManualCheckpointRequest();
+				if (!state.fallbackActive) {
+					checkpointFenceActive = false;
+					checkpointSaved = false;
+					checkpointWriteClaimed = false;
+				}
+			}
+			sendManualCheckpoint(ctx);
+			return { cancel: true };
+		}
+
+		// While a user-requested checkpoint is pending, automatic threshold
+		// compaction must not bypass it. If its prompt never entered the branch,
+		// queue it again; otherwise wait for a successful notes write.
+		if (manualCheckpointRequest?.windowId === state.currentWindowId) {
+			if (manualCheckpointRequest.phase === "saved") return buildRollover(compactEvent);
+			if (manualCheckpointRequest.phase === "awaiting") {
+				if (!checkpointFenceActive) sendManualCheckpoint(ctx);
+				return { cancel: true };
+			}
 		}
 
 		const branch = compactEvent.branchEntries as LooseEntry[];
@@ -607,6 +766,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		pendingWindow = null;
 		rolloverRequested = false;
 		compactionInFlight = false;
+		manualCheckpointRequest = null;
 		checkpointFenceActive = false;
 		checkpointSaved = false;
 		checkpointWriteClaimed = false;
@@ -632,28 +792,43 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_compact_failed", (event, _ctx) => {
 		if (!bundle.defaults.enabled) return;
+		const activeManualRequest = manualCheckpointRequest?.windowId === state.currentWindowId ? manualCheckpointRequest : null;
+		const manualWasCompacting = activeManualRequest?.phase === "compacting";
+		const manualCheckpointWasSaved = activeManualRequest !== null && checkpointSaved;
 		pendingWindow = null;
 		compactionInFlight = false;
 		continueAfterRollover = false;
-		// A session_before_compact { cancel: true } result is reported through
-		// this event with aborted=true. It only rejects that compact attempt;
-		// the hard/new-context rollover intent must survive for agent_settled.
-		if (!event.aborted) {
-			rolloverRequested = false;
-			state = { ...state, pendingNewContext: false };
+		if (activeManualRequest) {
+			if (manualWasCompacting) {
+				// A user-requested rollover never retries behind Esc or a real failure.
+				// Keep a successful checkpoint reusable for an explicit /compact retry;
+				// normal user activity invalidates it in message_end.
+				rolloverRequested = false;
+				state = { ...state, pendingNewContext: false };
+				activeManualRequest.phase = manualCheckpointWasSaved ? "saved" : "awaiting";
+				activeManualRequest.promptQueued = false;
+				checkpointSaved = manualCheckpointWasSaved;
+				checkpointWriteClaimed = manualCheckpointWasSaved;
+			}
+			// When the first /compact is intentionally cancelled to launch the
+			// checkpoint agent, preserve any concurrently delivered prompt or note.
+		} else {
+			// A session_before_compact { cancel: true } result is reported through
+			// this event with aborted=true. It only rejects that compact attempt;
+			// the hard/new-context rollover intent must survive for agent_settled.
+			if (!event.aborted) {
+				rolloverRequested = false;
+				state = { ...state, pendingNewContext: false };
+			}
+			checkpointSaved = false;
+			checkpointWriteClaimed = false;
 		}
-		checkpointSaved = false;
-		checkpointWriteClaimed = false;
 		coordination.clearRolloverOwnerLatch();
 		persist();
 		const errorMessage = event.errorMessage;
 		coordination.publish(errorMessage !== undefined ? { error: errorMessage } : {});
-		// Keep checkpointFenceActive armed: a failed rollover can be retried
-		// after rewriting the checkpoint if needed.
-		// aborted=true is expected for our one-shot threshold cancel; the
-		// rollover request remains armed for the next settled boundary.
-		// On a real rollover failure, fallbackActive stays set so the next
-		// threshold crossing retries the rollover.
+		// Keep checkpointFenceActive armed after a real failure. Fallbacks require
+		// a rewritten checkpoint; manual requests may reuse one already saved.
 	});
 
 	// ---------------------------------------------------------------------
@@ -692,9 +867,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		if (rolloverRequested || state.pendingNewContext) startDeferredRollover(ctx);
 	});
 
-	// Once the fallback has actually entered the branch, isolate the model at
-	// the checkpoint boundary. The in-flight response is left untouched; this
-	// hook only controls subsequent tool execution.
+	// Once a checkpoint request enters the branch, isolate the model at that
+	// boundary. The in-flight response is left untouched; this hook only
+	// controls subsequent tool execution.
 	pi.on("tool_call", (event) => {
 		if (!checkpointFenceActive) return undefined;
 		const tool = event as unknown as { toolName?: string; input?: Record<string, unknown> };
@@ -726,6 +901,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		rolloverRequested = false;
 		compactionInFlight = false;
 		continueAfterRollover = false;
+		manualCheckpointRequest = null;
 		checkpointFenceActive = false;
 		checkpointSaved = false;
 		checkpointWriteClaimed = false;

@@ -21,6 +21,7 @@ export const CUSTOM_TYPE_CONTEXT_WINDOW = `${CUSTOM_TYPE_PREFIX}context-window`;
 export const CUSTOM_TYPE_REMINDER = `${CUSTOM_TYPE_PREFIX}reminder`;
 export const CUSTOM_TYPE_FALLBACK = `${CUSTOM_TYPE_PREFIX}fallback`;
 export const CUSTOM_TYPE_CONTINUE = `${CUSTOM_TYPE_PREFIX}continue`;
+export const CUSTOM_TYPE_MANUAL_CHECKPOINT = `${CUSTOM_TYPE_PREFIX}manual-checkpoint`;
 /** Marker embedded in rollover compaction summaries so the plugin can recognize its own windows. */
 export const BOOTSTRAP_MARKER = "<context_window_reset/>";
 
@@ -121,11 +122,21 @@ export function recentItemsSection(
 	return ["", header, ...lines].join("\n");
 }
 
+/** Checkpoint request created when the user invokes Pi's built-in /compact command. */
+export function manualCheckpointMessage(currentWindowId: string, recentItems: string[] = []): string {
+	return [
+		`<context_window_checkpoint source_context_window_id="${currentWindowId}" reason="manual">`,
+		`The user requested a fresh context window. Before it starts, make exactly one notes write or append call to save a concise checkpoint: the current goal, decisions, completed work, unresolved issues, next steps, and the item id of every relevant user request, action, and tool call. Quote key user requirements verbatim with their item ids. Do not call new_context; a successful notes write will start the new window automatically. Do not continue substantive work in this window after saving the checkpoint.`,
+		`</context_window_checkpoint>`,
+		recentItemsSection(recentItems),
+	].join("\n");
+}
+
 /** Continuation nudge after a model-initiated or forced rollover. */
 export function continuationMessage(windowNumber: number): string {
 	return [
 		"A new context window has started (fresh window with no conversation history).",
-		"Read your notes checkpoint first, then continue the task. Use the read-only recovery tools only for details missing from notes.",
+		"Read your notes checkpoint first, then continue any unfinished task recorded there. Use the read-only recovery tools only for details missing from notes. If no unfinished task remains, wait for the user.",
 	].join("\n");
 }
 

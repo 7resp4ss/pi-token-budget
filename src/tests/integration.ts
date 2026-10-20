@@ -22,6 +22,7 @@ import {
 	CUSTOM_TYPE_CONTEXT_WINDOW,
 	CUSTOM_TYPE_CONTINUE,
 	CUSTOM_TYPE_FALLBACK,
+	CUSTOM_TYPE_MANUAL_CHECKPOINT,
 	CUSTOM_TYPE_REMINDER,
 } from "../prompts.ts";
 
@@ -793,7 +794,7 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 			message: { role: "assistant", content: [{ type: "toolCall", name: "write", arguments: { path: "src/file1.ts" } }] },
 	});
 
-	const summary = (h.threshold("manual") as CompactResult).compaction!.summary;
+	const summary = (h.threshold("overflow") as CompactResult).compaction!.summary;
 	// User requests: newest 25 of 30 kept, chronological, 5 omitted with pointer.
 	assert.ok(summary.includes("u-6 —"), "25th-from-last user request indexed");
 	assert.ok(summary.includes("u-30 —"), "newest user request indexed");
@@ -853,12 +854,312 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	h.cleanup();
 }
 
-// Manual and overflow compactions bypass checkpoint cancellation and do not
-// synthesize autonomous continuation when no model/fallback request exists.
-for (const reason of ["manual", "overflow"] as const) {
-	const h = createHarness(`short-${reason}`);
-	const result = h.threshold(reason, 190_000);
-	assert.ok(result.compaction, `${reason} must roll over directly`);
+// A user /compact request first runs one fenced checkpoint turn, then rolls
+// over and resumes unfinished work without requiring new_context.
+{
+	const h = createHarness("manual-checkpoint");
+	h.setUsage(100_000, 200_000);
+	const branchLength = h.getBranch().length;
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	assert.equal(h.getBranch().length, branchLength, "queued checkpoint prompt is not a branch fact before delivery");
+	assert.equal(h.steering.length, 1);
+	assert.equal(h.steering[0].customType, CUSTOM_TYPE_MANUAL_CHECKPOINT);
+	assert.match(h.steering[0].content, /user requested a fresh context window/i);
+	assert.match(h.steering[0].content, /exactly one notes write or append/i);
+	assert.match(h.steering[0].content, /Do not call new_context/);
+	assert.doesNotMatch(h.steering[0].content, /nearly exhausted/i);
+	assert.equal(h.coordinationStates.at(-1)?.phase, "checkpoint_required");
+
+	// A repeated command before the first prompt is delivered merges into the
+	// same request instead of adding another model instruction.
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	assert.equal(h.steering.length, 1);
+
+	const checkpointPrompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: {
+			role: "custom",
+			customType: checkpointPrompt.customType,
+			content: checkpointPrompt.content,
+			details: checkpointPrompt.details,
+		},
+	});
+	const blocked = h.fire("tool_call", { type: "tool_call", toolCallId: "manual-blocked", toolName: "bash", input: {} }) as Record<string, unknown>;
+	assert.equal(blocked.block, true);
+	assert.equal(blocked.terminate, true);
+
+	const notes = h.tools.get("notes")!;
+	assert.equal(
+		h.fire("tool_call", {
+			type: "tool_call",
+			toolCallId: "manual-note",
+			toolName: "notes",
+			input: { operation: "write", path: "checkpoint.md", text: "manual checkpoint" },
+		}),
+		undefined,
+	);
+	const saved = await notes.execute(
+		"manual-note",
+		{ operation: "write", path: "checkpoint.md", text: "manual checkpoint" },
+		undefined,
+		undefined,
+		h.ctx,
+	) as Record<string, unknown>;
+	assert.equal(saved.terminate, true);
+	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
+
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 1);
+	const compacted = h.threshold("manual", 100_000);
+	assert.ok(compacted.compaction);
+	h.commit(compacted.compaction!);
+	assert.equal(h.sent.at(-1)?.customType, CUSTOM_TYPE_CONTINUE);
+	assert.match(h.sent.at(-1)!.content, /continue any unfinished task/i);
+	assert.match(h.sent.at(-1)!.content, /If no unfinished task remains, wait for the user/i);
+	h.cleanup();
+}
+
+// The cancellation event for the first native /compact may race with the
+// checkpoint agent. A note that already succeeded must not be reset by that
+// expected cancellation.
+{
+	const h = createHarness("manual-checkpoint-cancel-race");
+	const first = h.fire("session_before_compact", {
+		type: "session_before_compact",
+		reason: "manual",
+		willRetry: false,
+		preparation: { tokensBefore: 100_000 },
+	}) as CompactResult;
+	assert.deepEqual(first, { cancel: true });
+	const prompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: prompt.customType, content: prompt.content, details: prompt.details },
+	});
+	h.fire("tool_call", {
+		type: "tool_call",
+		toolCallId: "race-note",
+		toolName: "notes",
+		input: { operation: "write", path: "checkpoint.md", text: "won the race" },
+	});
+	await h.tools.get("notes")!.execute(
+		"race-note",
+		{ operation: "write", path: "checkpoint.md", text: "won the race" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	h.fire("session_compact_failed", {
+		type: "session_compact_failed",
+		reason: "manual",
+		aborted: true,
+		willRetry: false,
+		fromExtension: false,
+	});
+	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 1, "the successful racing note still schedules rollover");
+	h.cleanup();
+}
+
+// Esc during the checkpoint agent turn cancels the user-requested rollover and
+// stale checkpoint instructions are removed from later model contexts.
+{
+	const h = createHarness("manual-checkpoint-esc");
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const checkpointPrompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: {
+			role: "custom",
+			customType: checkpointPrompt.customType,
+			content: checkpointPrompt.content,
+			details: checkpointPrompt.details,
+		},
+	});
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "aborted" } });
+	assert.equal(h.fire("tool_call", { type: "tool_call", toolCallId: "after-esc", toolName: "bash", input: {} }), undefined);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 0);
+	const filtered = h.fire("context", {
+		type: "context",
+		messages: [{
+			role: "custom",
+			customType: checkpointPrompt.customType,
+			content: checkpointPrompt.content,
+			details: checkpointPrompt.details,
+			display: true,
+			timestamp: 1,
+		}],
+	}) as { messages: unknown[] };
+	assert.deepEqual(filtered.messages, []);
+	h.cleanup();
+}
+
+// Esc after the notes write but before agent_settled keeps the durable note,
+// cancels automatic rollover, and permits an explicit retry without rewriting.
+{
+	const h = createHarness("manual-checkpoint-esc-after-save");
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const prompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: prompt.customType, content: prompt.content, details: prompt.details },
+	});
+	h.fire("tool_call", {
+		type: "tool_call",
+		toolCallId: "saved-then-esc",
+		toolName: "notes",
+		input: { operation: "write", path: "checkpoint.md", text: "durable" },
+	});
+	await h.tools.get("notes")!.execute(
+		"saved-then-esc",
+		{ operation: "write", path: "checkpoint.md", text: "durable" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "aborted" } });
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 0);
+	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
+	assert.ok(h.threshold("manual", 100_000).compaction);
+	h.cleanup();
+}
+
+// A real compaction failure keeps the successful manual checkpoint reusable;
+// an explicit /compact retry does not ask the model to write it again.
+{
+	const h = createHarness("manual-checkpoint-retry");
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const prompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: prompt.customType, content: prompt.content, details: prompt.details },
+	});
+	const notes = h.tools.get("notes")!;
+	h.fire("tool_call", {
+		type: "tool_call",
+		toolCallId: "retry-note",
+		toolName: "notes",
+		input: { operation: "append", path: "checkpoint.md", text: "saved once" },
+	});
+	await notes.execute(
+		"retry-note",
+		{ operation: "append", path: "checkpoint.md", text: "saved once" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	const failedAttempt = h.threshold("manual", 100_000);
+	assert.ok(failedAttempt.compaction);
+	h.failCompact("manual rollover failed");
+	assert.deepEqual(
+		{ phase: h.coordinationStates.at(-1)?.phase, error: h.coordinationStates.at(-1)?.error },
+		{ phase: "rollover_pending", error: "manual rollover failed" },
+	);
+	const promptsBeforeRetry = h.steering.length;
+	const retry = h.threshold("manual", 100_000);
+	assert.ok(retry.compaction);
+	assert.equal(h.steering.length, promptsBeforeRetry, "retry reuses the saved checkpoint");
+	h.commit(retry.compaction!);
+	assert.equal(h.sent.at(-1)?.customType, CUSTOM_TYPE_CONTINUE);
+	h.cleanup();
+}
+
+// Esc while the post-checkpoint compaction itself is running stops automatic
+// retry but preserves the saved checkpoint for a later explicit /compact.
+{
+	const h = createHarness("manual-compaction-esc");
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const prompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: prompt.customType, content: prompt.content, details: prompt.details },
+	});
+	h.fire("tool_call", {
+		type: "tool_call",
+		toolCallId: "compact-esc-note",
+		toolName: "notes",
+		input: { operation: "write", path: "checkpoint.md", text: "saved before Esc" },
+	});
+	await h.tools.get("notes")!.execute(
+		"compact-esc-note",
+		{ operation: "write", path: "checkpoint.md", text: "saved before Esc" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 1);
+	assert.ok(h.threshold("manual", 100_000).compaction);
+	h.fire("session_compact_failed", {
+		type: "session_compact_failed",
+		reason: "manual",
+		aborted: true,
+		willRetry: false,
+		fromExtension: true,
+	});
+	const compactRequest = h.compactRequests.shift();
+	assert.ok(compactRequest);
+	compactRequest.onError?.(new Error("Compaction cancelled"));
+	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.equal(h.compactCalls, 1, "Esc must not retry compaction automatically");
+	const retry = h.threshold("manual", 100_000);
+	assert.ok(retry.compaction, "a later explicit command reuses the saved checkpoint");
+	h.cleanup();
+}
+
+// Normal user activity after a failed manual rollover invalidates that saved
+// checkpoint, reopens tools, and requires a fresh checkpoint on the next command.
+{
+	const h = createHarness("manual-checkpoint-invalidated");
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const prompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: prompt.customType, content: prompt.content, details: prompt.details },
+	});
+	h.fire("tool_call", {
+		type: "tool_call",
+		toolCallId: "invalidate-note",
+		toolName: "notes",
+		input: { operation: "write", path: "checkpoint.md", text: "soon stale" },
+	});
+	await h.tools.get("notes")!.execute(
+		"invalidate-note",
+		{ operation: "write", path: "checkpoint.md", text: "soon stale" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	h.setIdle(true);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.ok(h.threshold("manual", 100_000).compaction);
+	h.failCompact("manual rollover failed");
+	h.fire("message_end", { type: "message_end", message: { role: "user", content: "new work" } });
+	assert.equal(h.coordinationStates.at(-1)?.phase, "ready");
+	assert.equal(h.fire("tool_call", { type: "tool_call", toolCallId: "new-work", toolName: "bash", input: {} }), undefined);
+	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	assert.equal(h.steering.at(-1)?.customType, CUSTOM_TYPE_MANUAL_CHECKPOINT);
+	h.cleanup();
+}
+
+// Overflow remains an emergency no-checkpoint path and does not synthesize a
+// continuation when no model, fallback, or manual request exists.
+{
+	const h = createHarness("short-overflow");
+	const result = h.threshold("overflow", 190_000);
+	assert.ok(result.compaction);
 	assert.equal(h.steering.length, 0);
 	h.commit(result.compaction!);
 	assert.notEqual(h.sent.at(-1)?.customType, CUSTOM_TYPE_CONTINUE);

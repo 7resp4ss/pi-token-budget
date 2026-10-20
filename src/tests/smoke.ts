@@ -10,7 +10,15 @@ import * as path from "node:path";
 import { DEFAULTS, loadConfig, reminderThreshold, resolveForModel, type ConfigBundle } from "../config.ts";
 import { HistoryStore } from "../stores/history-store.ts";
 import { NotesStore } from "../stores/notes-store.ts";
-import { BOOTSTRAP_MARKER, NEW_CONTEXT_CONFIRMATION, bootstrapText, guidanceMessage, newContextConfirmation, reminderMessage } from "../prompts.ts";
+import {
+	BOOTSTRAP_MARKER,
+	NEW_CONTEXT_CONFIRMATION,
+	bootstrapText,
+	guidanceMessage,
+	manualCheckpointMessage,
+	newContextConfirmation,
+	reminderMessage,
+} from "../prompts.ts";
 import { notesBloatWarnings } from "../tools/deps.ts";
 import { commitRollover, freshState, inferFromBranch, loadState, saveState, stateFilePath } from "../state.ts";
 
@@ -188,6 +196,12 @@ assert.ok(reminderMessage("w-c", 1234).includes("verbatim"), "reminder requires 
 assert.ok(reminderMessage("w-c", 1234).includes("only 1234 tokens remain"));
 assert.ok(reminderMessage("w-c", 1234).includes('source_context_window_id="w-c"'));
 assert.ok(reminderMessage("w-c", 1234).includes("clean up old notes"), "generic cleanup advice when no bloat");
+const manualCheckpoint = manualCheckpointMessage("w-c", ["u1 — user — finish the parser"]);
+assert.match(manualCheckpoint, /user requested a fresh context window/i);
+assert.match(manualCheckpoint, /exactly one notes write or append/i);
+assert.match(manualCheckpoint, /Do not call new_context/);
+assert.match(manualCheckpoint, /u1 — user — finish the parser/);
+assert.doesNotMatch(manualCheckpoint, /nearly exhausted|pi-token-budget|token-budget/i);
 
 // The new_context confirmation carries the recent-item index in the OLD window
 // and degrades to the plain sentence when the branch has nothing to index.
@@ -506,6 +520,7 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 		{ id: "n4", type: "custom_message", customType: "pi-token-budget:continue", content: "keep going" },
 		{ id: "n5", type: "custom_message", customType: "reframe:audit", content: "another extension's message" },
 		{ id: "n6", type: "message", message: { role: "assistant", content: [{ type: "text", text: "real answer" }] } },
+		{ id: "n7", type: "custom_message", customType: "pi-token-budget:manual-checkpoint", content: "manual checkpoint request" },
 	];
 	const noisy = new HistoryStore(noisyBranch as never);
 	assert.deepEqual(
@@ -519,9 +534,9 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 			.map((i) => i.itemId),
 		["n6", "n5"],
 	);
-	assert.equal(noisy.listItems({ scope: "all", kind: "all", recentFirst: false, previewChars: 40 }).length, 6, "all scope retains diagnostics");
+	assert.equal(noisy.listItems({ scope: "all", kind: "all", recentFirst: false, previewChars: 40 }).length, 7, "all scope retains diagnostics");
 	assert.deepEqual(noisy.searchContents("checkpoint", { scope: "task", excerptChars: 40 }), []);
-	assert.deepEqual(noisy.searchContents("checkpoint", { scope: "all", excerptChars: 40 }).map((i) => i.itemId), ["n3"]);
+	assert.deepEqual(noisy.searchContents("checkpoint", { scope: "all", excerptChars: 40 }).map((i) => i.itemId), ["n7", "n3"]);
 }
 
 // Task projection blocks recursive recovery noise without losing ordinary
