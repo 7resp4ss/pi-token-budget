@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-token-budget?style=flat-square)](https://www.npmjs.com/package/pi-token-budget) [![license](https://img.shields.io/npm/l/pi-token-budget?style=flat-square)](LICENSE)
 
-Token-budget context window management for [Pi](https://github.com/earendil-works/pi): **no-summary context rollover** with model-authored notes checkpoints, read-only history recovery, and a post-fallback tool-call fence. It replaces lossy summarization compaction while preserving the current in-flight response.
+Token-budget context window management for [Pi](https://github.com/earendil-works/pi): **no-summary context rollover** with model-authored notes checkpoints, read-only history recovery, and a post-fallback tool-call fence. It replaces lossy summarization compaction while preserving the current in-flight response. Replaces pi's summarization compaction with the mechanism pioneered by codex's `token_budget` feature (#27488 series).
 
 ## At a glance
 
