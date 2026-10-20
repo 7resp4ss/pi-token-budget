@@ -74,9 +74,9 @@ Rollover carries zero summary: the new window keeps none of the old conversation
 | `get_context_remaining` | Real-time remaining tokens (pull channel) + current window id (`w1`, `w2`, …) |
 | `new_context` | Declares a rollover (no parameters); executed after the turn ends, environment state is unaffected. Its confirmation returns this window's bounded recent-item index as copyable anchors (see below) |
 | `notes` | Virtual-path filesystem: `read/write/append/delete/search/list`, survives across windows, ≤1MB per file; read supports line/char dual pagination; soft warnings on bloat |
-| `history` | Read-only index: `list_windows/list_items/read_item/search_contents`, char-level pagination |
+| `history` | Read-only current-session recovery with `list_windows/list_items/search_contents/read_item`; stable ids, literal-search excerpts, source filters, UTF-16 reads, and snapshot cursors |
 
-All tool output is bounded (char-level pagination + total truncation), so reading history or notes can never blow up the fresh window by accident.
+All tool output is bounded (character pagination, complete-record packing, and a total cap), so reading history or notes cannot accidentally fill a fresh window.
 
 ### Where item ids are handed over
 
@@ -84,7 +84,24 @@ The reminder and the exhaustion fallback both append a bounded recent-item index
 
 `new_context` closes that gap by returning the same index in its own confirmation text. That text is a tool result **of the old window**, so the rollover sentinel discards it along with the rest of the trace: the fresh window pays zero tokens, while the model — still inside a path with no fence — can `notes.append` the ids before the turn ends. Ids cross the boundary inside model-curated notes, never as a system-pushed trace dump.
 
-That index is built with the plugin's own bookkeeping messages (`guidance`/`reminder`/`fallback`/`continue`) filtered out: they are not task conversation and would otherwise crowd out real entries from a 25-slot budget.
+That index uses the same task projection as `history`: token-budget bookkeeping is filtered before the 25-slot limit, while ordinary conversation and external tool evidence remain addressable. Structured thinking and nested tool-result blocks are never rendered.
+
+### History API
+
+`history` remains one tool because recovery is one workflow and operation names are small. Its flat schema is validated again at runtime with operation-specific allowlists, so irrelevant or misspelled fields return a corrective error rather than being silently ignored.
+
+| Operation | Required | Defaults and behavior |
+|---|---|---|
+| `list_windows` | — | Window metadata with task/all item counts |
+| `list_items` | — | `kind="message"`, `scope="task"`, `limit=20`, newest first |
+| `search_contents` | `query` | Literal, case-sensitive search; `kind="all"`, `scope="task"`, `limit=10`, newest first; returns up to three short located regions per item |
+| `read_item` | `item_id` | Canonical safe text from UTF-16 `offset_chars=0`, `limit_chars=2000` |
+
+`scope="task"` removes token-budget calls/results, plugin guidance, and rollover bootstraps. Use `scope="all"` only for diagnostics. `kind` selects `message`, `tool_call`, `tool_result`, or `all`; `tool_name` narrows calls/results and by itself implies `kind="tool_result"`. Search result offsets address the exact same canonical text read by `read_item`, including emoji-aware JavaScript UTF-16 coordinates.
+
+List and search results are complete-record packed under a 6000-character ceiling. When more records exist, the result includes an opaque `next_cursor`; continue with only the same `operation` and that cursor. The cursor fixes the original branch leaf and filters, rejects edits/tampering and cross-session reuse, ignores later appends, and fails explicitly if branch navigation removes its snapshot ancestor.
+
+A short-lived release exposed four split tools. They are no longer registered. Persisted guidance that names `history_list_windows`, `history_list_items`, `history_search`, or `history_read_item` receives one request-local migration message; existing item ids remain valid.
 
 ## Install
 
@@ -155,7 +172,7 @@ Coexists with [pi-subagents](https://github.com/nicobailon/pi-subagents) (`pi in
 - Window state and notes are strictly isolated by sessionId (`<sessionDir>/pi-token-budget/notes/<sessionId>/`); sessions and subagents can never read or overwrite each other's checkpoints
 - Each subagent pays roughly 350 tokens of first-window bootstrap overhead
 
-**Mind the tools whitelist**: pi-subagents' built-in agents declare `tools:` whitelists, and tools not on the list (including this extension's 4 tools) are unavailable inside those subagents — the rollover choreography then degrades to the forced path. To fix it, add the 4 tools to the whitelists of the agents you use: place a full definition in the user-level agents directory (`~/.pi/agent/agents/<name>.md` — a same-named file overrides the built-in definition entirely) and extend the tools line:
+**Mind the tools whitelist**: pi-subagents' built-in agents declare `tools:` whitelists, and tools not on the list (including this extension's four tools) are unavailable inside those subagents — the rollover choreography then degrades to the forced path. To fix it, add all four tools to the whitelists of the agents you use: place a full definition in the user-level agents directory (`~/.pi/agent/agents/<name>.md` — a same-named file overrides the built-in definition entirely) and extend the tools line:
 
 ```yaml
 tools: read, grep, find, ls, bash, edit, write, ..., get_context_remaining, new_context, notes, history

@@ -174,12 +174,16 @@ assert.ok(!boot.includes("Files edited in this session"), "empty file index omit
 const bootWithFiles = bootstrapText(
 	{ firstWindowId: "w-a", previousWindowId: "w-b", currentWindowId: "w-c", windowNumber: 5 },
 	["u1 — please ship the plugin"],
-	["src/auth.ts (last edit: e17)", "(2 other file(s) also edited — recover those edits with history search_contents \"[tool_call\", or list_items role \"assistant\")"],
+	['src/auth.ts (last edit: e17)', '(2 other file(s) also edited — call history with {"operation":"search_contents","query":"[tool_call edit]","kind":"tool_call"})'],
 );
 assert.ok(bootWithFiles.includes("Files edited in this session"));
 assert.ok(bootWithFiles.includes("src/auth.ts (last edit: e17)"));
 assert.ok(bootWithFiles.includes("2 other file(s) also edited"));
-assert.ok(guidanceMessage({ firstWindowId: "w-a", previousWindowId: null, currentWindowId: "w-c", windowNumber: 1 }).includes("verbatim"), "guidance requires verbatim quotes");
+const firstWindowGuidance = guidanceMessage({ firstWindowId: "w-a", previousWindowId: null, currentWindowId: "w-c", windowNumber: 1 });
+assert.ok(firstWindowGuidance.includes("verbatim"), "guidance requires verbatim quotes");
+assert.doesNotMatch(firstWindowGuidance, /pi-token-budget|token-budget/i, "model guidance stays product-agnostic");
+assert.doesNotMatch(firstWindowGuidance, /list_windows|list_items|search_contents|read_item/, "operation guidance belongs to the history tool schema");
+assert.ok(!boot.includes("Recovery protocol:"), "bootstrap recovery is a hint, not a task checklist");
 assert.ok(reminderMessage("w-c", 1234).includes("verbatim"), "reminder requires verbatim quotes");
 assert.ok(reminderMessage("w-c", 1234).includes("only 1234 tokens remain"));
 assert.ok(reminderMessage("w-c", 1234).includes('source_context_window_id="w-c"'));
@@ -335,20 +339,25 @@ assert.deepEqual(
 	["w1", "w2"],
 );
 assert.ok(windows[1].openedByCompaction);
-const items = history.listItems({ previewChars: 50 });
+assert.deepEqual(
+	windows.map((window) => [window.taskItems, window.allItems]),
+	[[5, 5], [1, 2]],
+	"window counts use the same task/all inclusion rules as retrieval",
+);
+const items = history.listItems({ scope: "all", kind: "all", recentFirst: false, previewChars: 50 });
 assert.equal(items.length, 7); // e1..e5 in w1, then e6 (compaction bootstrap) + e7 in w2
 assert.equal(items[0].itemId, "e1");
 assert.equal(items[6].windowId, "w2");
 const read = history.readItem("e1", 0, 5);
 assert.equal(read.text, "hello");
 assert.equal(read.totalChars, "hello remote compact".length);
-const found = history.searchContents("remote", { previewChars: 60 });
+const found = history.searchContents("remote", { excerptChars: 60 });
 assert.deepEqual(
 	found.map((f) => f.itemId),
 	["e1"],
 );
-assert.ok(found[0].preview.includes("remote"));
-const w2Items = history.listItems({ windowId: "w2", previewChars: 50 });
+assert.ok(found[0].regions.some((region) => region.text.includes("remote")));
+const w2Items = history.listItems({ windowId: "w2", scope: "all", kind: "all", recentFirst: false, previewChars: 50 });
 assert.deepEqual(
 	w2Items.map((i) => i.itemId),
 	["e6", "e7"],
@@ -371,6 +380,61 @@ assert.deepEqual(
 );
 assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 
+// Search coordinates address the same canonical UTF-16 text as readItem.
+// Hidden blocks split searchable intervals, so a query cannot bridge them.
+{
+	const canonicalBranch = [
+		{
+			id: "c1",
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "secret-before" },
+					{ type: "text", text: "A😀needleZ" },
+					{ type: "toolResult", content: "secret-nested" },
+					{ type: "text", text: "tail needle" },
+				],
+			},
+		},
+		{ id: "c2", type: "message", message: { role: "user", content: `😀${"x".repeat(200)} hit xx hit xx hit xx hit` } },
+		{ id: "c3", type: "message", message: { role: "toolResult", toolCallId: "future-call", content: [{ type: "thinking", thinking: "hidden-result-thought" }] } },
+		{ id: "c4", type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "future-call", name: "bash", arguments: { command: "echo later" } }] } },
+		{ id: "c5", type: "message", message: { role: "toolResult", toolCallId: "future-call", content: "linked-after-call" } },
+		{ id: "c6", type: "message", message: { role: "bashExecution", command: "pwd", output: "bash-output", exitCode: 0 } },
+	];
+	const canonical = new HistoryStore(canonicalBranch as never);
+	const full = canonical.readItem("c1", 0, 1000);
+	assert.equal(full.text, "A😀needleZ\ntail needle");
+	assert.equal(full.totalChars, 22, "canonical offsets use JavaScript UTF-16 units");
+	const hits = canonical.searchContents("needle", { recentFirst: false, excerptChars: 80 });
+	assert.deepEqual(hits[0].regions.flatMap((region) => region.matches), [
+		{ start: 3, end: 9 },
+		{ start: 16, end: 22 },
+	]);
+	for (const region of hits[0].regions) {
+		assert.equal(
+			canonical.readItem("c1", region.readOffset, region.readLimit).text,
+			region.text,
+			"search read coordinates reproduce the exact excerpt",
+		);
+	}
+	assert.deepEqual(canonical.searchContents("secret", { scope: "all", excerptChars: 80 }), []);
+	assert.deepEqual(canonical.searchContents("Z\ntail", { excerptChars: 80 }), [], "hidden source blocks prevent cross-gap matches");
+
+	const many = canonical.searchContents("hit", { recentFirst: false, excerptChars: 45 }).find((item) => item.itemId === "c2");
+	assert.ok(many);
+	assert.equal(many.regions.flatMap((region) => region.matches).length, 3);
+	assert.equal(many.moreMatchesInItem, true);
+	assert.equal(many.regions[0].matches[0].start, 203, "emoji contributes two UTF-16 code units");
+
+	assert.equal(canonical.readItem("c3", 0, 100).text, "[empty tool result]");
+	assert.equal(canonical.readItem("c3", 0, 100).source?.toolName, undefined, "future calls never back-fill a result source");
+	assert.equal(canonical.readItem("c5", 0, 100).source?.toolName, "bash", "prior calls associate missing toolName");
+	assert.equal(canonical.readItem("c6", 0, 100).text, "bash-output");
+	assert.equal(canonical.readItem("c6", 0, 100).source?.toolName, "bash");
+}
+
 // --- history lazy rendering ----------------------------------------------
 // The constructor is a metadata-only pass; text is built per touched entry.
 {
@@ -380,10 +444,10 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 	assert.equal(lazy.renderedTextCount(), 1, "readItem renders exactly one entry");
 
 	const lazyAll = new HistoryStore(branch as never);
-	const lazyItems = lazyAll.listItems({ previewChars: 50 });
+	const lazyItems = lazyAll.listItems({ scope: "all", kind: "all", recentFirst: false, previewChars: 50 });
 	assert.equal(lazyItems.length, 7);
-	assert.equal(lazyAll.renderedTextCount(), 6, "full listItems renders only the page's content entries (compaction summary is a plain reference)");
-	assert.equal(lazyItems[0].chars, "hello remote compact".length, "chars stays exact under lazy rendering");
+	assert.equal(lazyAll.renderedTextCount(), 7, "full listItems renders its complete page");
+	assert.equal(lazyItems[0].totalChars, "hello remote compact".length, "totalChars stays exact under lazy rendering");
 
 	// Repeated paginated reads of one item render independently and correctly.
 	const paged = new HistoryStore(branch as never);
@@ -392,7 +456,7 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 	assert.equal(p1.text, "hello");
 	assert.equal(p2.text, " remote compact");
 	assert.equal(p1.totalChars, p2.totalChars);
-	assert.equal(paged.renderedTextCount(), 2);
+	assert.equal(paged.renderedTextCount(), 1, "repeated pages reuse the canonical render");
 }
 
 // Inclusion/exclusion equivalence: the cheap metadata pass must exactly
@@ -413,20 +477,21 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 		{ id: "x6", type: "message", message: { role: "assistant", content: [{ type: "toolResult", content: "ignored" }, { type: "thinking" }] } },
 		// plain string content → included
 		{ id: "x7", type: "message", message: { role: "user", content: "plain string request" } },
-		// compaction with empty summary → still included
+		// compaction with empty summary opens a window but has no readable body
 		{ id: "x8", type: "compaction", summary: "" },
 	];
 	const edgeStore = new HistoryStore(edgeBranch as never);
 	assert.deepEqual(
-		edgeStore.listItems({ previewChars: 200 }).map((i) => i.itemId),
-		["x3", "x5", "x7", "x8"],
+		edgeStore.listItems({ scope: "all", kind: "all", recentFirst: false, previewChars: 200 }).map((i) => i.itemId),
+		["x3", "x5", "x7"],
 	);
 	assert.equal(edgeStore.readItem("x3", 0, 100).text, "[empty tool result]");
 	assert.ok(edgeStore.readItem("x5", 0, 100).text.includes("[foo block omitted]"));
 	const w1 = edgeStore.listWindows().find((w) => w.windowId === "w1");
 	assert.ok(w1);
-	assert.equal(w1.itemCount, 3, "empty-render entries never enter window counts");
-	assert.equal(edgeStore.readItem("x8", 0, 10).windowId, "w2", "compaction opens a new window even with empty summary");
+	assert.equal(w1.allItems, 3, "empty-render entries never enter window counts");
+	assert.equal(w1.taskItems, 3, "non-bookkeeping edge entries remain in task scope");
+	assert.equal(edgeStore.listWindows().at(-1)?.windowId, "w2", "empty compaction still opens a window");
 }
 
 // Extension bookkeeping messages must not consume slots from a bounded
@@ -444,19 +509,130 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 	];
 	const noisy = new HistoryStore(noisyBranch as never);
 	assert.deepEqual(
-		noisy.listItems({ previewChars: 40, excludeCustomTypePrefixes: ["pi-token-budget:"] }).map((i) => i.itemId),
+		noisy.listItems({ scope: "task", kind: "all", recentFirst: false, previewChars: 40 }).map((i) => i.itemId),
 		["n1", "n5", "n6"],
 	);
 	// The filter runs before the limit: excluded entries must not displace kept ones.
 	assert.deepEqual(
 		noisy
-			.listItems({ previewChars: 40, recentFirst: true, limit: 2, excludeCustomTypePrefixes: ["pi-token-budget:"] })
+			.listItems({ scope: "task", kind: "all", previewChars: 40, recentFirst: true, limit: 2 })
 			.map((i) => i.itemId),
 		["n6", "n5"],
 	);
-	assert.equal(noisy.listItems({ previewChars: 40 }).length, 6, "without the option nothing is filtered");
-	// search_contents stays unfiltered: recovering a plugin message by id is valid.
-	assert.deepEqual(noisy.searchContents("checkpoint", { previewChars: 40 }).map((i) => i.itemId), ["n3"]);
+	assert.equal(noisy.listItems({ scope: "all", kind: "all", recentFirst: false, previewChars: 40 }).length, 6, "all scope retains diagnostics");
+	assert.deepEqual(noisy.searchContents("checkpoint", { scope: "task", excerptChars: 40 }), []);
+	assert.deepEqual(noisy.searchContents("checkpoint", { scope: "all", excerptChars: 40 }).map((i) => i.itemId), ["n3"]);
+}
+
+// Task projection blocks recursive recovery noise without losing ordinary
+// evidence or useful blocks that share an assistant message with history.
+{
+	const projectedBranch = [
+		{ id: "p1", type: "message", message: { role: "user", content: [{ type: "text", text: "original alpha request" }] } },
+		{
+			id: "p2",
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "SECRET structured thought alpha" },
+					{ type: "text", text: "visible assistant explanation" },
+					{ type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "printf alpha-evidence" } },
+					{ type: "toolCall", id: "history-old", name: "history", arguments: { operation: "search_contents", query: "alpha" } },
+					{ type: "toolCall", id: "history-current", name: "history_search", arguments: { query: "self-only-token" } },
+				],
+			},
+		},
+		{
+			id: "p3",
+			type: "message",
+			message: { role: "toolResult", toolCallId: "history-old", toolName: "history", content: [{ type: "text", text: "old recursive alpha result" }] },
+		},
+		{
+			id: "p4",
+			type: "message",
+			message: { role: "toolResult", toolCallId: "bash-1", content: [{ type: "text", text: "alpha-evidence" }] },
+		},
+		{
+			id: "p5",
+			type: "message",
+			message: { role: "toolResult", toolCallId: "unknown-call", content: [{ type: "text", text: "unknown-source-kept" }] },
+		},
+		{ id: "p6", type: "custom_message", customType: "pi-token-budget:reminder", content: "internal budget reminder" },
+		{ id: "p7", type: "custom_message", customType: "foreign:audit", content: "external extension record" },
+		{
+			id: "p8",
+			type: "message",
+			message: { role: "assistant", content: [{ type: "toolCall", id: "history-repeat", name: "history_search", arguments: { query: "alpha" } }] },
+		},
+		{
+			id: "p9",
+			type: "message",
+			message: { role: "toolResult", toolCallId: "history-repeat", toolName: "history_search", content: [{ type: "text", text: "wrapped alpha results" }] },
+		},
+	];
+	const beforeRepeat = new HistoryStore(projectedBranch.slice(0, 7) as never).searchContents("alpha", {
+		scope: "task",
+		excerptChars: 200,
+	});
+	const projected = new HistoryStore(projectedBranch as never);
+	assert.deepEqual(
+		projected.searchContents("alpha", { scope: "task", excerptChars: 200 }).map((item) => item.itemId),
+		beforeRepeat.map((item) => item.itemId),
+		"adding another history call/result does not change task matches",
+	);
+	assert.deepEqual(
+		projected.searchContents("self-only-token", {
+			scope: "all",
+			kind: "all",
+			excludedToolCallId: "history-current",
+			excerptChars: 200,
+		}),
+		[],
+		"the executing history block is excluded even from all scope",
+	);
+	assert.deepEqual(
+		projected.searchContents("old recursive", { scope: "task", excerptChars: 200 }),
+		[],
+		"prior history results do not flow back into task search",
+	);
+	assert.deepEqual(
+		projected.searchContents("old recursive", { scope: "all", excerptChars: 200 }).map((item) => item.itemId),
+		["p3"],
+		"all scope keeps prior internal records for diagnostics",
+	);
+	const internalCall = projected.searchContents("search_contents", { scope: "all", kind: "tool_call", excerptChars: 200 });
+	assert.deepEqual(internalCall.map((item) => item.itemId), ["p2"]);
+	assert.equal(internalCall[0].internal, true, "mixed messages mark projected internal blocks in all scope");
+	assert.deepEqual(
+		projected.searchContents("alpha-evidence", { scope: "task", kind: "message", excerptChars: 200 }).map((item) => item.itemId),
+		[],
+		"message projection never matches tool arguments or results",
+	);
+	assert.deepEqual(
+		projected.searchContents("alpha-evidence", { scope: "task", kind: "tool_call", excerptChars: 200 }).map((item) => item.itemId),
+		["p2"],
+	);
+	const evidence = projected.searchContents("alpha-evidence", { scope: "task", kind: "tool_result", excerptChars: 200 });
+	assert.deepEqual(evidence.map((item) => item.itemId), ["p4"]);
+	assert.equal(evidence[0].source?.toolName, "bash", "missing toolName is recovered through toolCallId");
+	assert.equal(evidence[0].source?.assistantItemId, "p2");
+	assert.deepEqual(
+		projected.searchContents("unknown-source-kept", { scope: "task", kind: "tool_result", excerptChars: 200 }).map((item) => item.itemId),
+		["p5"],
+		"unknown tool-result sources are retained rather than guessed away",
+	);
+	const messageOnly = projected.listItems({ scope: "task", kind: "message", recentFirst: false, previewChars: 500 });
+	assert.deepEqual(messageOnly.map((item) => item.itemId), ["p1", "p2"]);
+	assert.ok(messageOnly[1].preview.includes("visible assistant explanation"));
+	assert.ok(!messageOnly[1].preview.includes("SECRET") && !messageOnly[1].preview.includes("tool_call"));
+	assert.ok(projected.readItem("p3", 0, 500).text.includes("old recursive"), "hidden task records stay readable by stable id");
+	assert.equal(projected.readItem("p4", 0, 500).source?.toolName, "bash");
+	assert.deepEqual(
+		projected.listItems({ scope: "task", kind: "all", recentFirst: false, previewChars: 100 }).map((item) => item.itemId),
+		["p1", "p2", "p4", "p5", "p7"],
+		"task scope filters internal calls/results and plugin custom messages before limiting",
+	);
 }
 
 // Laziness holds at scale: a single read_item renders exactly one entry
@@ -479,13 +655,13 @@ assert.equal(foreignHistory.readItem("f3", 0, 100).windowId, "w2");
 	// filter-all-then-slice, without rendering past the limit-th match.
 	const recentStore = new HistoryStore(bigBranch as never);
 	assert.deepEqual(
-		recentStore.searchContents("turn", { limit: 3, recentFirst: true, previewChars: 50 }).map((m) => m.itemId),
+		recentStore.searchContents("turn", { limit: 3, recentFirst: true, excerptChars: 50 }).map((m) => m.itemId),
 		["big-4999", "big-4998", "big-4997"],
 	);
 	assert.equal(recentStore.renderedTextCount(), 3, "recent-first search stops after limit matches");
 	const forwardStore = new HistoryStore(bigBranch as never);
 	assert.deepEqual(
-		forwardStore.searchContents("turn", { limit: 2, previewChars: 50 }).map((m) => m.itemId),
+		forwardStore.searchContents("turn", { limit: 2, recentFirst: false, excerptChars: 50 }).map((m) => m.itemId),
 		["big-0", "big-1"],
 	);
 	assert.equal(forwardStore.renderedTextCount(), 2, "forward search stops after limit matches");

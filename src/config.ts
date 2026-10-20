@@ -57,7 +57,7 @@ export interface TokenBudgetConfig {
 	maxToolOutputChars: number;
 	/** Per-file size cap for notes. */
 	notesMaxFileBytes: number;
-	/** Truncate per-item previews in history list_items to this many chars. */
+	/** Truncate per-item previews in history list/search tools to this many chars. */
 	historyItemPreviewChars: number;
 }
 

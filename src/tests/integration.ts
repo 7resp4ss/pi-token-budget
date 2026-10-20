@@ -9,7 +9,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import tokenBudgetExtension from "../index.ts";
+import { DEFAULTS } from "../config.ts";
 import {
 	COORD_CHANNEL_STATE,
 	isCoordinationState,
@@ -56,6 +58,13 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 	const tools = new Map<
 		string,
 		{
+			description?: string;
+			promptSnippet?: string;
+			parameters?: {
+				required?: string[];
+				additionalProperties?: boolean;
+				properties?: Record<string, unknown>;
+			};
 			execute: (
 				id: string,
 				params: unknown,
@@ -228,7 +237,13 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 		sessionManager: {
 			getSessionDir: () => dir,
 			getSessionId: () => sessionId,
-			getBranch: () => branch,
+			getLeafId: () => (branch.at(-1) as { id?: string } | undefined)?.id ?? null,
+			getBranch: (fromId?: string) => {
+				if (fromId === undefined) return branch;
+				const index = branch.findIndex((entry) => (entry as { id?: string }).id === fromId);
+				if (index < 0) throw new Error(`unknown branch entry ${fromId}`);
+				return branch.slice(0, index + 1);
+			},
 		},
 		getContextUsage: () =>
 			usage.tokens === null
@@ -282,7 +297,18 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	const h = createHarness("delivery");
 	assert.equal(h.getBranch().length, 1);
 	assert.equal((h.getBranch()[0] as BranchEntry).customType, CUSTOM_TYPE_CONTEXT_WINDOW);
-	assert.deepEqual([...h.tools.keys()].sort(), ["get_context_remaining", "history", "new_context", "notes"]);
+	assert.deepEqual([...h.tools.keys()].sort(), [
+		"get_context_remaining",
+		"history",
+		"new_context",
+		"notes",
+	]);
+	const modelToolSurface = [...h.tools.values()].map(({ description, promptSnippet, parameters }) => ({
+		description,
+		promptSnippet,
+		parameters,
+	}));
+	assert.doesNotMatch(JSON.stringify(modelToolSurface), /pi-token-budget|token-budget/i, "model-facing tool guidance stays product-agnostic");
 
 	h.setUsage(150_000);
 	h.setIdle(false);
@@ -311,6 +337,318 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	const escaped = await notesTool.execute("delete-escaped", { operation: "delete", path: "../outside" }, undefined, undefined, h.ctx);
 	assert.match(toolText(escaped), /unsupported path component/);
 	h.cleanup();
+}
+
+// The single history tool has a discriminated runtime contract, filters
+// recursive bookkeeping, preserves canonical offsets, and pages snapshots.
+{
+	const historyBranch = [
+		{ id: "hu1", type: "message", message: { role: "user", content: [{ type: "text", text: "find original quartz request" }] } },
+		{
+			id: "ha1",
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "hidden quartz thought" },
+					{ type: "text", text: "visible answer" },
+					{ type: "toolCall", id: "old-history", name: "history", arguments: { operation: "search_contents", query: "quartz" } },
+					{ type: "toolCall", id: "current-search", name: "history", arguments: { operation: "search_contents", query: "self-query-only" } },
+					{ type: "toolCall", id: "bash-call", name: "bash", arguments: { command: "printf quartz-evidence" } },
+				],
+			},
+		},
+		{
+			id: "hr1",
+			type: "message",
+			message: { role: "toolResult", toolName: "history", toolCallId: "old-history", content: [{ type: "text", text: "old history quartz wrapper" }] },
+		},
+		{
+			id: "hr2",
+			type: "message",
+			message: { role: "toolResult", toolCallId: "bash-call", content: [{ type: "text", text: "quartz-evidence" }] },
+		},
+		{ id: "hc1", type: "custom_message", customType: CUSTOM_TYPE_REMINDER, content: "internal reminder" },
+	];
+	const h = createHarness("history-tools", historyBranch);
+	const historyTool = h.tools.get("history")!;
+	assert.equal(h.tools.has("history_search"), false, "transient split tools are not registered");
+	assert.deepEqual(historyTool.parameters!.required, ["operation"]);
+	assert.equal(historyTool.parameters!.additionalProperties, false);
+	assert.throws(
+		() =>
+			validateToolArguments(
+				{ name: "history", parameters: historyTool.parameters } as never,
+				{ type: "toolCall", id: "schema-missing", name: "history", arguments: {} },
+			),
+		/operation/,
+		"pinned runtime rejects a missing operation",
+	);
+	assert.throws(
+		() =>
+			validateToolArguments(
+				{ name: "history", parameters: historyTool.parameters } as never,
+				{ type: "toolCall", id: "schema-unknown", name: "history", arguments: { operation: "list_windows", surprise: true } },
+			),
+		/additional|unexpected/i,
+		"pinned runtime rejects unknown fields",
+	);
+
+	const task = await historyTool.execute("current-search", { operation: "search_contents", query: "quartz" }, undefined, undefined, h.ctx);
+	assert.doesNotMatch(JSON.stringify(task), /pi-token-budget|token-budget/i, "history feedback stays product-agnostic");
+	assert.match(toolText(task), /hu1/);
+	assert.match(toolText(task), /hr2/);
+	assert.doesNotMatch(toolText(task), /hr1|old history quartz wrapper|hidden quartz thought/);
+	const self = await historyTool.execute(
+		"current-search",
+		{ operation: "search_contents", query: "self-query-only", scope: "all" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(self), /No matching history records/);
+	const diagnostic = await historyTool.execute(
+		"another-call",
+		{ operation: "search_contents", query: "old history quartz wrapper", scope: "all" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(diagnostic), /hr1/);
+	assert.match(toolText(diagnostic), /internal=true/);
+	const sourced = await historyTool.execute(
+		"source-search",
+		{ operation: "search_contents", query: "quartz-evidence", tool_name: "bash", recent_first: false },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(sourced), /\[hr2\]/);
+	assert.doesNotMatch(toolText(sourced), /\[ha1\]/, "tool_name alone implies tool_result");
+
+	const list = await historyTool.execute(
+		"list-call",
+		{ operation: "list_items", role: "assistant" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(list), /visible answer/);
+	assert.doesNotMatch(toolText(list), /tool_call history/);
+	const read = await historyTool.execute(
+		"read-call",
+		{ operation: "read_item", item_id: "hr1", limit_chars: 100 },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(read), /old history quartz wrapper/);
+	assert.match(toolText(read), /tool_name=history/);
+
+	const missingId = await historyTool.execute("bad-read", { operation: "read_item" }, undefined, undefined, h.ctx);
+	assert.equal((missingId as { isError?: boolean }).isError, true);
+	assert.match(toolText(missingId), /history read_item failed \[invalid_arguments\]/);
+	assert.deepEqual(
+		h.fire("tool_result", {
+			type: "tool_result",
+			toolName: "history",
+			toolCallId: "bad-read",
+			input: { operation: "read_item" },
+			content: (missingId as { content: unknown }).content,
+			details: (missingId as { details: unknown }).details,
+			isError: false,
+		}),
+		{ isError: true },
+		"pinned hosts receive the error marker through the tool_result hook",
+	);
+	for (const params of [
+		{ operation: "search_contents", query: "   " },
+		{ operation: "search_contents", query: "quartz", offset_chars: 1 },
+		{ operation: "list_items", limit: "20" },
+		{ operation: "list_windows", role: "user" },
+	]) {
+		const invalid = await historyTool.execute("bad-args", params, undefined, undefined, h.ctx);
+		assert.equal((invalid as { isError?: boolean }).isError, true);
+		assert.match(toolText(invalid), /invalid_arguments/);
+	}
+	const noMatch = await historyTool.execute(
+		"no-match",
+		{ operation: "search_contents", query: "definitely-absent" },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.notEqual((noMatch as { isError?: boolean }).isError, true, "no matches is a successful empty result");
+
+	h.setBranch([
+		...historyBranch,
+		{ id: "long-item", type: "message", message: { role: "user", content: [{ type: "text", text: "x".repeat(20_000) }] } },
+	]);
+	const longRead = await historyTool.execute(
+		"long-read",
+		{ operation: "read_item", item_id: "long-item", limit_chars: 100_000 },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	const longText = toolText(longRead);
+	assert.ok(longText.length <= DEFAULTS.maxToolOutputChars);
+	const range = longText.match(/showing=0\.\.(\d+)/);
+	assert.ok(range);
+	const nextOffsetMarker = longText.lastIndexOf("\nnext_offset_chars=");
+	assert.equal(
+		longText.slice(longText.indexOf("\n") + 1, nextOffsetMarker < 0 ? undefined : nextOffsetMarker).length,
+		Number(range[1]),
+		"read header range matches delivered body",
+	);
+
+	const bulkBranch = Array.from({ length: 80 }, (_, index) => ({
+		id: `bulk-${index}`,
+		type: "message",
+		message: { role: "user", content: [{ type: "text", text: `bulk ${index} ${"z".repeat(600)}` }] },
+	}));
+	h.setBranch(bulkBranch);
+	const packed = await historyTool.execute(
+		"packed-list",
+		{ operation: "list_items", limit: 200, recent_first: false },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	const packedText = toolText(packed);
+	const packedDetails = packed as { details: { records: Array<{ itemId: string }>; nextCursor?: string } };
+	assert.ok(packedText.length <= 6000, "list/search index responses use the tighter output budget");
+	assert.ok(packedDetails.details.nextCursor, "budget packing emits a continuation cursor");
+	for (const record of packedDetails.details.records) assert.match(packedText, new RegExp(`\\[${record.itemId}\\]`));
+	assert.equal((packedText.match(/^\[bulk-/gm) ?? []).length, packedDetails.details.records.length, "only complete records are delivered");
+
+	const firstPage = await historyTool.execute(
+		"bulk-list",
+		{ operation: "list_items", limit: 3, recent_first: false },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	const firstText = toolText(firstPage);
+	assert.match(firstText, /\[bulk-0\]/);
+	assert.match(firstText, /\[bulk-2\]/);
+	assert.doesNotMatch(firstText, /\[bulk-3\]/);
+	const cursor = (firstPage as { details: { nextCursor?: string } }).details.nextCursor;
+	assert.ok(cursor);
+
+	// Appends after page one do not enter the fixed snapshot.
+	h.setBranch([...bulkBranch, { id: "bulk-new", type: "message", message: { role: "user", content: "new append" } }]);
+	const secondPage = await historyTool.execute(
+		"bulk-next",
+		{ operation: "list_items", cursor },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(secondPage), /\[bulk-3\]/);
+	assert.doesNotMatch(toolText(secondPage), /bulk-new/);
+
+	const searchPage = await historyTool.execute(
+		"search-page",
+		{ operation: "search_contents", query: "bulk", limit: 2, recent_first: false },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	const searchCursor = (searchPage as { details: { nextCursor?: string } }).details.nextCursor;
+	assert.ok(searchCursor);
+	const searchNext = await historyTool.execute(
+		"search-next",
+		{ operation: "search_contents", cursor: searchCursor },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(searchNext), /\[bulk-2\]/);
+	const wrongOperation = await historyTool.execute(
+		"wrong-operation",
+		{ operation: "list_items", cursor: searchCursor },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(wrongOperation), /cursor_operation_mismatch/);
+
+	const tampered = `${cursor!.slice(0, -1)}${cursor!.endsWith("A") ? "B" : "A"}`;
+	const badCursor = await historyTool.execute(
+		"bad-cursor",
+		{ operation: "list_items", cursor: tampered },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.equal((badCursor as { isError?: boolean }).isError, true);
+	assert.match(toolText(badCursor), /invalid_cursor/);
+
+	const resumed = createHarness("history-tools", bulkBranch);
+	const resumedPage = await resumed.tools.get("history")!.execute(
+		"resume-cursor",
+		{ operation: "list_items", cursor },
+		undefined,
+		undefined,
+		resumed.ctx,
+	);
+	assert.match(toolText(resumedPage), /\[bulk-3\]/, "cursor survives extension restart in the same session");
+	resumed.cleanup();
+
+	const wrongSession = createHarness("history-other-session", bulkBranch);
+	const mismatch = await wrongSession.tools.get("history")!.execute(
+		"wrong-session",
+		{ operation: "list_items", cursor },
+		undefined,
+		undefined,
+		wrongSession.ctx,
+	);
+	assert.match(toolText(mismatch), /cursor_session_mismatch/);
+	wrongSession.cleanup();
+
+	h.setBranch(bulkBranch.slice(0, 20));
+	const stale = await historyTool.execute(
+		"stale-branch",
+		{ operation: "list_items", cursor },
+		undefined,
+		undefined,
+		h.ctx,
+	);
+	assert.match(toolText(stale), /cursor_stale_branch/);
+	h.cleanup();
+}
+
+// Persisted guidance from the transient split-tool release gets one
+// request-local context message; current single-tool guidance gets none.
+{
+	const splitGuidance = {
+		id: "split-guidance",
+		type: "custom_message",
+		customType: CUSTOM_TYPE_CONTEXT_WINDOW,
+		content: "Use history_list_items, history_search, and history_read_item after reset.",
+		display: false,
+	};
+	const h = createHarness("split-history-guidance", [splitGuidance]);
+	const before = h.getBranch().length;
+	const baseMessages = [{ role: "user", content: [{ type: "text", text: "continue" }], timestamp: 1 }];
+	const first = h.fire("context", { type: "context", messages: baseMessages }) as { messages: Array<{ role: string; content: unknown }> };
+	assert.equal(first.messages.length, 2);
+	assert.match(String(first.messages[1].content), /single history tool/);
+	assert.match(String(first.messages[1].content), /operation field/);
+	assert.equal(h.getBranch().length, before, "migration guidance is request-local, not a session entry");
+	assert.equal(h.fire("context", { type: "context", messages: baseMessages }), undefined, "hint is one-shot");
+	h.cleanup();
+
+	const current = createHarness("current-history-guidance", [
+		{ ...splitGuidance, id: "current-guidance", content: "Use history with operation read_item for a known id." },
+	]);
+	assert.equal(
+		current.fire("context", { type: "context", messages: baseMessages }),
+		undefined,
+		"current guidance does not receive a migration hint",
+	);
+	current.cleanup();
 }
 
 // Two-state threshold flow: reminder in branch -> fallback opportunity ->
@@ -462,14 +800,14 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	assert.ok(!summary.includes("u-5 —"), "older-than-25 user request dropped");
 	assert.ok(summary.indexOf("u-6 —") < summary.indexOf("u-30 —"), "index stays chronological");
 	assert.match(summary, /5 older user request\(s\) not shown/);
-	assert.match(summary, /list_items role "user"/);
+	assert.match(summary, /history with \{"operation":"list_items","role":"user"\}/);
 	// Edited files: 30 distinct paths -> 5 kept, file1 deduped to its latest edit.
 	assert.ok(summary.includes("Files edited in this session"));
 	assert.ok(summary.includes("src/file1.ts (last edit: a-re)"), "dedupe keeps most recent edit id");
 	assert.ok(summary.includes("src/file30.ts (last edit: a-30)"));
 	assert.ok(!summary.includes("src/file2.ts"), "file edited only early is dropped");
 	assert.match(summary, /25 other file\(s\) also edited/);
-	assert.match(summary, /search_contents "\[tool_call"/);
+	assert.match(summary, /history with \{"operation":"search_contents","query":"\[tool_call edit\]","kind":"tool_call"\}/);
 	h.cleanup();
 }
 

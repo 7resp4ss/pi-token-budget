@@ -1,6 +1,6 @@
 /**
- * Tool registration entry point. Registers all four model-facing tools:
- * get_context_remaining, new_context, notes, history.
+ * Tool registration entry point. Registers four model-facing tools:
+ * get_context_remaining, new_context, notes, and history.
  *
  * See each sibling file for its tool's documentation, and README.md in this
  * directory for the overall tool surface.

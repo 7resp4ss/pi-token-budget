@@ -20,6 +20,7 @@
  * Entry point: `export default function (pi: ExtensionAPI)`.
  */
 
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, reminderThreshold, resolveForModel, type ConfigBundle, type TokenBudgetConfig } from "./config.ts";
 import { CoordinationHost } from "./coordination.ts";
@@ -30,8 +31,8 @@ import {
 	CUSTOM_TYPE_CONTEXT_WINDOW,
 	CUSTOM_TYPE_CONTINUE,
 	CUSTOM_TYPE_FALLBACK,
-	CUSTOM_TYPE_PREFIX,
 	CUSTOM_TYPE_REMINDER,
+	HISTORY_TOOL_MIGRATION_HINT,
 	bootstrapText,
 	continuationMessage,
 	fallbackMessage,
@@ -56,6 +57,7 @@ interface LooseEntry {
 	type: string;
 	summary?: string;
 	customType?: string;
+	content?: unknown;
 	details?: unknown;
 }
 
@@ -78,6 +80,8 @@ const USER_REQUEST_INDEX_LIMIT = 25;
 const EDITED_FILE_INDEX_LIMIT = 5;
 /** Tool names whose `path` argument mutates a file and is worth indexing. */
 const FILE_EDIT_TOOL_NAMES = new Set(["edit", "write", "multiedit"]);
+/** Model tools whose returned error marker needs bridging on older hosts. */
+const WINDOW_TOOL_NAMES = new Set(["get_context_remaining", "new_context", "notes", "history"]);
 
 const truncatePath = (p: string): string => (p.length > 160 ? `${p.slice(0, 157)}...` : p);
 
@@ -116,6 +120,8 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	let checkpointFenceActive = false;
 	let checkpointSaved = false;
 	let checkpointWriteClaimed = false;
+	/** One-request compatibility guidance for sessions created with the transient split history tools. */
+	let historyMigrationHintPending = false;
 	/** Session id for coordination payloads; set on session_start. */
 	let currentSessionId = "pending-session";
 
@@ -148,8 +154,8 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		coordination.publish();
 	}
 
-	function currentBranch(ctx: ExtensionContext): LooseEntry[] {
-		return ctx.sessionManager.getBranch() as unknown as LooseEntry[];
+	function currentBranch(ctx: ExtensionContext, fromId?: string): LooseEntry[] {
+		return ctx.sessionManager.getBranch(fromId) as unknown as LooseEntry[];
 	}
 
 	function injectPassive(piApi: ExtensionAPI, customType: string, content: string, display: boolean): void {
@@ -209,12 +215,11 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	/** Bounded recent-item index (id — role — preview) for checkpoint prompts. */
 	function recentItemLines(ctx: ExtensionContext): string[] {
 		const items = new HistoryStore(currentBranch(ctx)).listItems({
+			scope: "task",
+			kind: "all",
 			recentFirst: true,
 			limit: 25,
 			previewChars: 120,
-			// Own reminders/fallbacks/continuations are bookkeeping, not task
-			// conversation: they must not eat slots from this bounded index.
-			excludeCustomTypePrefixes: [CUSTOM_TYPE_PREFIX],
 		});
 		return items
 			.reverse() // chronological order for readability
@@ -232,6 +237,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	function userRequestLines(branch: Array<{ id: string; type: string; summary?: string; customType?: string }>): string[] {
 		const items = new HistoryStore(branch as never).listItems({
 			role: "user",
+			scope: "task",
+			kind: "message",
+			recentFirst: false,
 			previewChars: 160,
 		});
 		const omitted = Math.max(0, items.length - USER_REQUEST_INDEX_LIMIT);
@@ -239,7 +247,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		const lines = kept.map((i) => `${i.itemId} — ${i.preview.replace(/\s+/g, " ")}`);
 		if (omitted > 0) {
 			lines.unshift(
-				`(${omitted} older user request(s) not shown — list them with history list_items role "user", then read_item by id)`,
+				`(${omitted} older user request(s) not shown — call history with {"operation":"list_items","role":"user"}, then read the returned id)`,
 			);
 		}
 		return lines;
@@ -250,9 +258,9 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 	 * windows, embedded in every bootstrap. The file analog of the user-request
 	 * index: system-guaranteed so the new window knows which files were being
 	 * changed even when the model never recorded them in notes. Each line
-	 * points at the item id of the most recent edit; read_item on it shows the
-	 * exact change. Pull-based (paths + ids only): file contents are re-read on
-	 * demand, never auto-injected.
+	 * carries the item id of the most recent edit; history read_item recovers
+	 * the exact change. Pull-based paths and ids are re-read on demand rather
+	 * than being injected into every fresh window.
 	 */
 	function editedFileLines(branch: LooseEntry[]): string[] {
 		const touches: Array<{ path: string; itemId: string }> = [];
@@ -281,10 +289,24 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		const omitted = recent.length - Math.min(recent.length, EDITED_FILE_INDEX_LIMIT);
 		if (omitted > 0) {
 			lines.unshift(
-				`(${omitted} other file(s) also edited — recover those edits with history search_contents "[tool_call", or list_items role "assistant")`,
+				`(${omitted} other file(s) also edited — call history with {"operation":"search_contents","query":"[tool_call edit]","kind":"tool_call"})`,
 			);
 		}
 		return lines;
+	}
+
+	function needsHistoryMigrationHint(branch: LooseEntry[]): boolean {
+		const guidance = branch.flatMap((entry) => {
+			if (entry.type === "custom_message" && entry.customType === CUSTOM_TYPE_CONTEXT_WINDOW && typeof entry.content === "string") {
+				return [entry.content];
+			}
+			if (entry.type === "compaction" && typeof entry.summary === "string" && entry.summary.includes(BOOTSTRAP_MARKER)) {
+				return [entry.summary];
+			}
+			return [];
+		});
+		const effective = guidance.at(-1);
+		return effective !== undefined && /\bhistory_(?:list_windows|list_items|search|read_item)\b/.test(effective);
 	}
 
 	/** Whether the current window already has its identity/guidance message. */
@@ -358,7 +380,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 				if (!notes) throw new Error("session not initialized yet");
 				return notes;
 			},
-			buildHistory: (ctx: ExtensionContext) => new HistoryStore(currentBranch(ctx)),
+			buildHistory: (ctx: ExtensionContext, fromId?: string) => new HistoryStore(currentBranch(ctx, fromId)),
 			recentItemLines: (ctx: ExtensionContext) => recentItemLines(ctx),
 			triggerCompaction: (ctx: ExtensionContext) => {
 				startDeferredRollover(ctx);
@@ -370,6 +392,15 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 			},
 		});
 	}
+
+	// pi-agent-core 0.84 ignores isError on a returned tool object; the
+	// extension hook bridges the private marker while newer hosts can consume
+	// the returned isError field directly.
+	pi.on("tool_result", (event) => {
+		const details = event.details as { error?: boolean } | undefined;
+		if (WINDOW_TOOL_NAMES.has(event.toolName) && details?.error === true) return { isError: true };
+		return undefined;
+	});
 
 	// ---------------------------------------------------------------------
 	// Session lifecycle
@@ -389,6 +420,7 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 		modelConfig = bundle.defaults;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const branch = currentBranch(ctx);
+		historyMigrationHintPending = needsHistoryMigrationHint(branch);
 		const loaded = loadState(sessionDir, sessionId);
 		state = loaded.sessionId === sessionId ? inferFromBranch(loaded, branch) : freshState(sessionId);
 		notes = new NotesStore(sessionDir, sessionId, bundle.defaults.notesMaxFileBytes);
@@ -416,6 +448,19 @@ export default function tokenBudgetExtension(pi: ExtensionAPI): void {
 				false,
 			);
 		}
+	});
+
+	pi.on("context", (event) => {
+		if (!bundle.defaults.enabled || !historyMigrationHintPending) return undefined;
+		historyMigrationHintPending = false;
+		const migrationMessage: AgentMessage = {
+			role: "custom",
+			customType: `${CUSTOM_TYPE_CONTEXT_WINDOW}:history-migration`,
+			content: HISTORY_TOOL_MIGRATION_HINT,
+			display: false,
+			timestamp: Date.now(),
+		};
+		return { messages: [...event.messages, migrationMessage] };
 	});
 
 	// ---------------------------------------------------------------------

@@ -32,8 +32,8 @@ export interface ToolDeps {
 	completeCheckpoint(): void;
 	/** Notes store for the active session. */
 	getNotes(): NotesStore;
-	/** History index built from the live session branch. */
-	buildHistory(ctx: ExtensionContext): HistoryStore;
+	/** History index built from the live branch or a fixed ancestor snapshot. */
+	buildHistory(ctx: ExtensionContext, fromId?: string): HistoryStore;
 	/**
 	 * Bounded recent-item index (id — role — preview) of the CURRENT window,
 	 * with the plugin's own bookkeeping messages filtered out. Used by the
@@ -47,11 +47,23 @@ export interface ToolDeps {
 	remainingTokens(ctx: ExtensionContext): number | null;
 }
 
-/** Build a tool result, truncated to the configured output cap. */
+/** Build a bounded successful tool result. */
 export function textResult(text: string, config: TokenBudgetConfig): { content: Array<{ type: "text"; text: string }>; details: unknown } {
 	return {
 		content: [{ type: "text", text: truncate(text, config.maxToolOutputChars) }],
-		details: { tool: "pi-token-budget" },
+		details: {},
+	};
+}
+
+/** Return a model-correctable failure without throwing away its explanation. */
+export function errorResult(
+	text: string,
+	config: TokenBudgetConfig,
+): { content: Array<{ type: "text"; text: string }>; details: unknown; isError: true } {
+	return {
+		content: [{ type: "text", text: truncate(text, config.maxToolOutputChars) }],
+		details: { error: true },
+		isError: true,
 	};
 }
 
@@ -97,7 +109,7 @@ export function notesBloatWarnings(getNotes: () => NotesStore, config: TokenBudg
 }
 
 export function requiredString(value: unknown, name: string): string {
-	if (typeof value !== "string" || value.length === 0) throw new Error(`${name} is required`);
+	if (typeof value !== "string" || value.trim().length === 0) throw new Error(`${name} is required and cannot be blank`);
 	return value;
 }
 
