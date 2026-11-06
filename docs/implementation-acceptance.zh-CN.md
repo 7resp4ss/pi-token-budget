@@ -1,6 +1,6 @@
 # 实现验收记录
 
-验收日期：2026-11-06。本报告针对 2.0.1 的 11 工具实现。发布内容已移除旧四工具版本的 fidelity-review/evidence/probes。
+验收日期：2026-11-06。本报告针对 2.0.2 的 11 工具实现，包含明文参数和手动压缩修复。发布内容已移除旧四工具版本的 fidelity-review/evidence/probes。
 
 结论：11 个独立函数及计划中的共享恢复能力已落盘。所有函数 description、原始参数定义和 executionMode 与冻结参考逐项比较通过。Pi 平铺命名、notes 字符分页、system 指导和 deliberate checkpoint fence 为明确保留的适配，不将此结果解读为整个 Codex token-budget 后端 100% 复刻。
 
@@ -59,13 +59,27 @@ Fence 验证覆盖所有非写入工具的拦截、别的 agent notes 不能满�
 
 `src/tests/smoke.ts` 和 integration 继承并适配了 main 的 canonical 文本、安全投影、最多三个命中区间、source 关联、排除自身调用和 6000 字符完整行打包回归。emoji 搜索坐标可原样回读；thinking/嵌套结果不进入检索。旧 aggregate 指导仅注入一次非持久迁移提示。
 
-手动 `/compact` 的回归覆盖：首次取消并请求 checkpoint、重复请求合并、own-agent 单次写入、取消事件竞态、Esc、保存后取消、失败后复用、正常新输入使 checkpoint 失效，以及 overflow 紧急路径。成功后继续未完成工作；无剩余任务时等待用户。
+手动 `/compact` 的回归覆盖：同一次原生压缩等待 checkpoint settled、重复请求合并、own-agent 单次写入、嵌套自动压缩竞态、写入失败保留窗口及 fence、显式重试、Esc、保存后取消、失败后复用、正常新输入使 checkpoint 失效，以及独立 overflow 紧急路径。成功后继续未完成工作；无剩余任务时等待用户。
 
 ## 真实 SDK 与主动换窗边界
 
-`src/tests/sdk-context.ts` 直接验证了手动 compact 首次取消、模型保存自己的 checkpoint、自动再次 compact 和切换到 w2，无需 new_context。测试的 keepRecentTokens 为 32，避免原先极小的 1 导致 Pi 在工具结果结尾找不到 cut point；Pi 的 compaction preparation 仍是扩展执行前置条件。测试在真实 Pi SDK 中使用离线 fake stream，直接捕获 provider context。确认稳定指导进入 system，前导 system 的位置得到保留，真实 user/tool-result ID 可见，用户原始记录保持不变，任务内容未进入 systemPrompt，换窗后窗口身份更新。新窗口不再携带旧原始会话；受控 user-request index 按设计保留引用。
+`src/tests/sdk-context.ts` 直接验证了手动 compact 等待模型保存自己的 checkpoint，并在同一次原生压缩切换到 w2，无需 new_context。断言只有一对 compaction_start/compaction_end，且没有 session_compact_failed 事件。测试的 keepRecentTokens 为 32，避免原先极小的 1 导致 Pi 在工具结果结尾找不到 cut point；Pi 的 compaction preparation 仍是扩展执行前置条件。测试在真实 Pi SDK 中使用离线 fake stream，直接捕获 provider context。确认稳定指导进入 system，前导 system 的位置得到保留，真实 user/tool-result ID 可见，用户原始记录保持不变，任务内容未进入 systemPrompt，换窗后窗口身份更新。新窗口不再携带旧原始会话；受控 user-request index 按设计保留引用。
 
 同一测试在另一个 cwd 创建前台 SDK child，加载生成的 required 入口与 ambient 扩展；最终仍为一套 11 个工具。独立 Node 进程用相同入口启动 memory session，写入含图像的历史记录后退出，父 session 通过实际 history_read_item 工具执行取回原生图像。工具白名单没有被扩展。
+
+## 手动压缩误报修复（2.0.2）
+
+在真实 Pi 1.5.0 TUI 中，用 tmux、隔离会话和离线 provider 复现：手动输入 `/compact` 后先出现 `Error: Compaction cancelled`，随后保存一次 checkpoint 并成功换到 w2。根因是原实现返回 cancel=true 安排 checkpoint，再次调用压缩；Pi 将第一次取消按错误显示。
+
+修复仅使用扩展公开接口：异步等待 checkpoint 的 agent_settled，使用最新分支返回 compaction，让同一次原生手动压缩完成。没有修改 Pi/OI 或 pi-subagents，也没有拦截终端输入或隐藏错误消息。checkpoint 写入失败或用户主动取消时仍保留当前窗口。
+
+| 实际终端场景 | 结果 |
+|---|---|
+| 修复前正常 `/compact` | 1 次 checkpoint，1 次成功换窗，出现中间取消错误 |
+| 修复后正常 `/compact` | 1 次 checkpoint，1 次成功换窗，没有取消错误或失败事件 |
+| checkpoint 回合中按 Esc，随后继续输入 | 取消模型回合和换窗，0 次成功换窗，后续对话正常完成 |
+
+固定 Pi 0.84.4 和隔离 Pi 1.5.0 均通过类型检查及全部 8 套测试。终端测试未调用在线模型。用户主动按 Esc 时 Pi 仍按自身行为显示取消信息；模型不遵守保存指令时也不承诺换窗成功。
 
 agent-core contract 的采样次数：
 

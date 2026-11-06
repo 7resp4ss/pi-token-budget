@@ -18,6 +18,7 @@ const oldDir = process.env.PI_CODING_AGENT_DIR;
 process.env.PI_CODING_AGENT_DIR = temp;
 const snapshots: unknown[] = [];
 const errors: unknown[] = [];
+const compactFailures: unknown[] = [];
 let nextCalls: Array<{ type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }> = [];
 const usage = { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 20, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const model = { id: "offline", name: "Offline", provider: "budget-offline", api: "openai-completions", baseUrl: "http://offline.invalid", input: ["text", "image"], reasoning: false, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 4096 } as const;
@@ -54,7 +55,7 @@ async function sdk(name: string, factories: InlineExtension[], additionalExtensi
 
 try {
 	let rootAPI: ExtensionAPI | undefined;
-	const parent = await sdk("parent-worktree", [{ name: "token-budget", factory: pi => { rootAPI = pi; createTokenBudgetExtension({ subagents: { enabled: false } })(pi); } }]);
+	const parent = await sdk("parent-worktree", [{ name: "token-budget", factory: pi => { rootAPI = pi; pi.on("session_compact_failed", event => { compactFailures.push(event); }); createTokenBudgetExtension({ subagents: { enabled: false } })(pi); } }]);
 	const parentSnapshot = getTokenBudgetTask(rootAPI!)!;
 	assert.equal(parentSnapshot.agentName, "/root");
 	await parent.session.prompt("USER_DATA_CANARY");
@@ -86,19 +87,18 @@ try {
 	assert.equal(toolResults.length, 2);
 	for (const result of toolResults) assert.ok(JSON.stringify(snapshots.at(-1)).includes(`[id: ${result.id}]`), "real tool result ID reaches provider");
 	assert.ok(!providerSystemText(snapshots.at(-1)).includes("TOOL_DATA_CANARY"));
-	// Real /compact first cancels to run a fenced checkpoint turn, then the
-	// successful note schedules the actual reset without a new_context call.
+	// Real /compact waits for the fenced checkpoint turn and completes the same
+	// native attempt, without a cancellation error or a second compaction.
 	nextCalls = [{ type: "toolCall", id: "manual-checkpoint", name: "notes_write_file", arguments: { path: "checkpoint", text: "MANUAL_CHECKPOINT_CANARY: no unfinished work" } }];
-	const reset = new Promise<{ summary: string }>((resolve, reject) => {
-		const timeout = setTimeout(() => { unsubscribe(); reject(new Error("manual checkpoint did not complete rollover: " + JSON.stringify({ errors, streaming: parent.session.isStreaming, snapshots: snapshots.length }))); }, 5000);
-		const unsubscribe = parent.session.subscribe(event => {
-			if (event.type !== "compaction_end" || !event.result) return;
-			clearTimeout(timeout); unsubscribe(); resolve(event.result);
-		});
+	const compactEvents: string[] = [];
+	const unsubscribe = parent.session.subscribe(event => {
+		if (event.type === "compaction_start" || event.type === "compaction_end") compactEvents.push(event.type);
 	});
-	await assert.rejects(parent.session.compact(), /Compaction cancelled/);
-	const compacted = await reset;
+	const compacted = await parent.session.compact();
 	await parent.session.waitForIdle();
+	unsubscribe();
+	assert.deepEqual(compactFailures, [], "successful manual rollover emits no cancellation/failure");
+	assert.deepEqual(compactEvents, ["compaction_start", "compaction_end"], "checkpoint and rollover share one native compaction");
 	assert.match(compacted.summary, /Current context window id: w2/);
 	const noteFiles = compacted.summary.split("\n").filter(line => line.startsWith("{")).map(line => JSON.parse(line) as { path: string; bytes: number });
 	assert.deepEqual(noteFiles.map(file => file.path), ["/root/notes/checkpoint"], "reset lists actual note paths instead of assuming checkpoint.md");

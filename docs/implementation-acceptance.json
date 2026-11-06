@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-06T09:06:19.218607Z",
+  "generated_at": "2026-11-06T10:03:55.139939Z",
   "codex_reference_commit": "f3a90545aed3188ee1e5c119ec89a742de399cdc",
   "node": "v24.16.0",
   "definitions": {
@@ -77,7 +77,7 @@
     "src/config.ts": "3e6441986a40f1bf9b122d73d89e8486614d82fd1bad7a2f31e7d5c1b05a4f43",
     "src/context-projection.ts": "c4450cb1b17c385ee293e10b3e345503e0ef7b3b914bf8cf1eb77774b023b70f",
     "src/coordination.ts": "57e9163b33595ea2dd12508afc20082d59728ff954a0f5e78a3ead9050068fbb",
-    "src/index.ts": "b5563659360580e82a3ea24d78473562ea76350f20c456919ebcdd25e5fcab3b",
+    "src/index.ts": "7d783c27b028999e2cc60878f9af82e085fe2a766497f6ca4ee01e60f7b0f766",
     "src/prompts.ts": "dd95f666e4db83cc900a6f0f70504364c7ef755e314e2a89994ce72e2411a026",
     "src/state.ts": "f3e645baa97320bce8e9ae79edb8b50998453f9f30623c2cdb5728baf003018a",
     "src/storage.ts": "1a519f82488d393f2c1bbb74f657ef57c28f7a8f864eb7fb919e616522439764",
@@ -155,13 +155,13 @@
     ],
     "behavior_limit": "Prompt delivery and recovery are verified. No new runtime requirement enforces a notes write before every final answer; offline streams do not measure real-model adherence."
   },
-  "package_version": "2.0.1",
+  "package_version": "2.0.2",
   "release_validation": {
-    "version": "2.0.1",
-    "pinned_environment": "Pi 0.84.4; the encryption-annotation fix passed typecheck and all eight test suites. The final SDK compatibility assertions also passed separately.",
-    "latest_environment": "Pi 1.5.0; SDK provider context verified eleven tool declarations without encrypted fields. No online model was called.",
+    "version": "2.0.2",
+    "pinned_environment": "Pi 0.84.4; the manual compaction fix passed typecheck and all eight test suites, including checkpoint failure/retry and cancellation regressions.",
+    "latest_environment": "Pi 1.5.0; typecheck and all eight test suites passed. Real TUI checks verified successful manual rollover without a cancellation error and Esc followed by resumed conversation. No online model was called.",
     "package_contents": "Explicit files allowlist: runtime TypeScript, license, README, CHANGELOG, and current documentation. Tests, fixtures, scripts, CI files, credential files, office documents, and obsolete reports are excluded.",
-    "publication_identity": "pi-token-budget@2.0.1; registry https://registry.npmjs.org/; latest tag."
+    "publication_identity": "pi-token-budget@2.0.2; registry https://registry.npmjs.org/; latest tag."
   },
   "plaintext_schema_follow_up": {
     "status": "included in 2.0.1",
@@ -174,5 +174,26 @@
       "SDK context tests passed on Pi 0.84.4 and isolated Pi 1.5.0; validation reads context.tools or system-message toolsAdded, respectively."
     ],
     "limits": "No online A/B request to the affected provider was made. Existing opaque note contents are not decoded or rewritten."
+  },
+  "manual_compact_follow_up": {
+    "status": "included in 2.0.2",
+    "root_cause": "The former manual checkpoint workflow cancelled the first native compaction to run the checkpoint, then retried. Pi rendered the intentional cancellation as an error.",
+    "change": "Keep the native session_before_compact hook pending until the checkpoint agent settles; return rollover content built from the latest branch in the same native attempt.",
+    "preserved": [
+      "One successful write or append to own notes before rollover.",
+      "No context replacement inside the checkpoint tool batch.",
+      "Esc cancels the checkpoint run and native manual compaction.",
+      "A saved checkpoint remains reusable after cancellation or rollover failure.",
+      "An unsaved checkpoint retains the current window and fence.",
+      "Nested automatic compaction cannot bypass or reset the active manual checkpoint."
+    ],
+    "checks": [
+      "Pi 0.84.4: typecheck and all eight test suites passed.",
+      "Isolated Pi 1.5.0: typecheck and all eight test suites passed.",
+      "Real SDK asserts one compaction_start/compaction_end pair and no failure event for successful manual rollover.",
+      "Real Pi 1.5.0 TUI with an offline provider: one checkpoint, one successful rollover, no Compaction cancelled or prompt-during-compaction error.",
+      "Real Pi 1.5.0 TUI: Esc during the checkpoint yields no rollover; a subsequent ordinary prompt completes."
+    ],
+    "limits": "No online model was called. Pi still shows cancellation when the user aborts or the checkpoint run fails to save. Native preparation still rejects sessions that are too small before invoking the extension."
   }
 }

@@ -73,6 +73,7 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 	const triggeredTurns: CustomMessage[] = [];
 	const compactRequests: CompactCallbacks[] = [];
 	const coordinationStates: TokenBudgetCoordinationState[] = [];
+	const notifications: string[] = [];
 	const busHandlers = new Map<string, Set<(data: unknown) => void>>();
 	const events = {
 		on: (channel: string, cb: (data: unknown) => void) => {
@@ -91,6 +92,7 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 	let entryCounter = 0;
 	let idle = true;
 	let compactCalls = 0;
+	let abortCalls = 0;
 	let usage: { tokens: number | null; contextWindow: number } = { tokens: null, contextWindow: 200_000 };
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-token-budget-session-"));
 
@@ -134,7 +136,11 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 		followUps,
 		triggeredTurns,
 		coordinationStates,
+		notifications,
 		dir,
+		get abortCalls() {
+			return abortCalls;
+		},
 		get compactCalls() {
 			return compactCalls;
 		},
@@ -181,7 +187,9 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 				reason,
 				willRetry: false,
 				preparation: { tokensBefore },
+				signal: new AbortController().signal,
 			}) as CompactResult;
+			assert.ok(!(result instanceof Promise), "use beginManual() for a new manual checkpoint");
 			if (result.cancel) {
 				harness.fire("session_compact_failed", {
 					type: "session_compact_failed",
@@ -191,6 +199,16 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 					fromExtension: false,
 				});
 			}
+			return result;
+		},
+		async beginManual(signal = new AbortController().signal): Promise<CompactResult> {
+			const result = await harness.fire("session_before_compact", {
+				type: "session_before_compact", reason: "manual", willRetry: false,
+				preparation: { tokensBefore: 100_000 }, signal,
+			}) as CompactResult;
+			if (result.cancel) harness.fire("session_compact_failed", {
+				type: "session_compact_failed", reason: "manual", aborted: true, willRetry: false, fromExtension: false,
+			});
 			return result;
 		},
 		commit(compaction: NonNullable<CompactResult["compaction"]>, streaming = false): void {
@@ -208,7 +226,7 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 				},
 			});
 		},
-		failCompact(errorMessage: string): void {
+		failCompact(errorMessage: string, native = false): void {
 			harness.fire("session_compact_failed", {
 				type: "session_compact_failed",
 				reason: "manual",
@@ -218,8 +236,8 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 				errorMessage,
 			});
 			const request = compactRequests.shift();
-			assert.ok(request, "expected a pending ctx.compact request");
-			request.onError?.(new Error(errorMessage));
+			if (!native) assert.ok(request, "expected a pending ctx.compact request");
+			request?.onError?.(new Error(errorMessage));
 		},
 		cleanup() {
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -237,11 +255,12 @@ function createHarness(sessionId = `itest-${Math.random().toString(16).slice(2)}
 				? { tokens: null, contextWindow: usage.contextWindow, percent: null }
 				: { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: 50 },
 		isIdle: () => idle,
+		abort: () => { abortCalls++; },
 		compact: (callbacks: CompactCallbacks) => {
 			compactCalls++;
 			compactRequests.push(callbacks);
 		},
-		ui: { notify: (_message: string, _level: string) => {} },
+		ui: { notify: (message: string, _level: string) => { notifications.push(message); } },
 	} as unknown as ExtensionContext;
 
 	tokenBudgetExtension(pi);
@@ -868,7 +887,9 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	const h = createHarness("manual-checkpoint");
 	h.setUsage(100_000, 200_000);
 	const branchLength = h.getBranch().length;
-	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const reset = h.beginManual();
+	let returned = false;
+	void reset.then(() => { returned = true; });
 	assert.equal(h.getBranch().length, branchLength, "queued checkpoint prompt is not a branch fact before delivery");
 	assert.equal(h.steering.length, 1);
 	assert.equal(h.steering[0].customType, CUSTOM_TYPE_MANUAL_CHECKPOINT);
@@ -916,11 +937,12 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	) as Record<string, unknown>;
 	assert.equal(saved.terminate, true);
 	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
+	assert.equal(returned, false, "do not replace context during the note tool batch");
 
 	h.setIdle(true);
 	h.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(h.compactCalls, 1);
-	const compacted = h.threshold("manual", 100_000);
+	const compacted = await reset;
+	assert.equal(h.compactCalls, 0, "the original native compaction performs the reset");
 	assert.ok(compacted.compaction);
 	h.commit(compacted.compaction!);
 	assert.equal(h.sent.at(-1)?.customType, CUSTOM_TYPE_CONTINUE);
@@ -929,23 +951,19 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	h.cleanup();
 }
 
-// The cancellation event for the first native /compact may race with the
-// checkpoint agent. A note that already succeeded must not be reset by that
-// expected cancellation.
+// Automatic threshold/overflow attempts during a manual checkpoint cannot
+// bypass the fence, replace the context mid-run, or reset a successful note.
 {
-	const h = createHarness("manual-checkpoint-cancel-race");
-	const first = h.fire("session_before_compact", {
-		type: "session_before_compact",
-		reason: "manual",
-		willRetry: false,
-		preparation: { tokensBefore: 100_000 },
-	}) as CompactResult;
-	assert.deepEqual(first, { cancel: true });
+	const h = createHarness("manual-checkpoint-auto-race");
+	const reset = h.beginManual();
 	const prompt = h.consumeSteer();
 	h.fire("message_end", {
 		type: "message_end",
 		message: { role: "custom", customType: prompt.customType, content: prompt.content, details: prompt.details },
 	});
+	assert.deepEqual(h.threshold("threshold"), { cancel: true });
+	assert.deepEqual(h.threshold("overflow"), { cancel: true });
+	assert.equal(h.coordinationStates.at(-1)?.phase, "checkpoint_required");
 	h.fire("tool_call", {
 		type: "tool_call",
 		toolCallId: "race-note",
@@ -959,17 +977,51 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 		undefined,
 		h.ctx,
 	);
-	h.fire("session_compact_failed", {
-		type: "session_compact_failed",
-		reason: "manual",
-		aborted: true,
-		willRetry: false,
-		fromExtension: false,
-	});
+	assert.deepEqual(h.threshold("threshold"), { cancel: true });
 	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
 	h.setIdle(true);
 	h.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(h.compactCalls, 1, "the successful racing note still schedules rollover");
+	assert.ok((await reset).compaction, "the successful note completes the original manual rollover");
+	assert.equal(h.compactCalls, 0);
+	h.cleanup();
+}
+
+// A failed note cannot discard the window. The native attempt ends when the
+// run settles, leaves the fence armed, and an explicit retry can save normally.
+{
+	const h = createHarness("manual-checkpoint-write-failed");
+	const reset = h.beginManual();
+	const prompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: prompt.customType, content: prompt.content, details: prompt.details },
+	});
+	const notes = h.tools.get("notes_write_file")!;
+	assert.equal(h.fire("tool_call", {
+		type: "tool_call", toolCallId: "failed-note", toolName: "notes_write_file",
+		input: { path: "checkpoint", text: "x".repeat(1_000_001) },
+	}), undefined);
+	await assert.rejects(notes.execute("failed-note", { path: "checkpoint", text: "x".repeat(1_000_001) }, undefined, undefined, h.ctx), /at or below/);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.deepEqual(await reset, { cancel: true });
+	assert.equal(h.compactCalls, 0);
+	assert.equal(h.coordinationStates.at(-1)?.phase, "checkpoint_required");
+	assert.match(h.notifications.at(-1)!, /checkpoint was not saved/);
+	assert.equal((h.fire("tool_call", { toolName: "history_list_windows", input: {} }) as { block: boolean }).block, true);
+
+	const retry = h.beginManual();
+	const retriedPrompt = h.consumeSteer();
+	h.fire("message_end", {
+		type: "message_end",
+		message: { role: "custom", customType: retriedPrompt.customType, content: retriedPrompt.content, details: retriedPrompt.details },
+	});
+	assert.equal(h.fire("tool_call", {
+		type: "tool_call", toolCallId: "retried-note", toolName: "notes_write_file",
+		input: { path: "checkpoint", text: "saved after retry" },
+	}), undefined);
+	await notes.execute("retried-note", { path: "checkpoint", text: "saved after retry" }, undefined, undefined, h.ctx);
+	h.fire("agent_settled", { type: "agent_settled" });
+	assert.ok((await retry).compaction);
 	h.cleanup();
 }
 
@@ -977,7 +1029,8 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 // stale checkpoint instructions are removed from later model contexts.
 {
 	const h = createHarness("manual-checkpoint-esc");
-	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const controller = new AbortController();
+	const reset = h.beginManual(controller.signal);
 	const checkpointPrompt = h.consumeSteer();
 	h.fire("message_end", {
 		type: "message_end",
@@ -988,10 +1041,13 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 			details: checkpointPrompt.details,
 		},
 	});
+	controller.abort();
+	assert.equal(h.abortCalls, 1, "Esc on native compaction also aborts the checkpoint agent");
 	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "aborted" } });
 	assert.equal(h.fire("tool_call", { type: "tool_call", toolCallId: "after-esc", toolName: "bash", input: {} }), undefined);
 	h.setIdle(true);
 	h.fire("agent_settled", { type: "agent_settled" });
+	assert.deepEqual(await reset, { cancel: true });
 	assert.equal(h.compactCalls, 0);
 	const filtered = h.fire("context", {
 		type: "context",
@@ -1012,7 +1068,8 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 // cancels automatic rollover, and permits an explicit retry without rewriting.
 {
 	const h = createHarness("manual-checkpoint-esc-after-save");
-	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const controller = new AbortController();
+	const reset = h.beginManual(controller.signal);
 	const prompt = h.consumeSteer();
 	h.fire("message_end", {
 		type: "message_end",
@@ -1031,9 +1088,10 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 		undefined,
 		h.ctx,
 	);
-	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "aborted" } });
+	controller.abort();
 	h.setIdle(true);
 	h.fire("agent_settled", { type: "agent_settled" });
+	assert.deepEqual(await reset, { cancel: true });
 	assert.equal(h.compactCalls, 0);
 	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
 	assert.ok(h.threshold("manual", 100_000).compaction);
@@ -1044,7 +1102,7 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 // an explicit /compact retry does not ask the model to write it again.
 {
 	const h = createHarness("manual-checkpoint-retry");
-	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const reset = h.beginManual();
 	const prompt = h.consumeSteer();
 	h.fire("message_end", {
 		type: "message_end",
@@ -1066,9 +1124,9 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	);
 	h.setIdle(true);
 	h.fire("agent_settled", { type: "agent_settled" });
-	const failedAttempt = h.threshold("manual", 100_000);
+	const failedAttempt = await reset;
 	assert.ok(failedAttempt.compaction);
-	h.failCompact("manual rollover failed");
+	h.failCompact("manual rollover failed", true);
 	assert.deepEqual(
 		{ phase: h.coordinationStates.at(-1)?.phase, error: h.coordinationStates.at(-1)?.error },
 		{ phase: "rollover_pending", error: "manual rollover failed" },
@@ -1086,7 +1144,7 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 // retry but preserves the saved checkpoint for a later explicit /compact.
 {
 	const h = createHarness("manual-compaction-esc");
-	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const reset = h.beginManual();
 	const prompt = h.consumeSteer();
 	h.fire("message_end", {
 		type: "message_end",
@@ -1107,8 +1165,8 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	);
 	h.setIdle(true);
 	h.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(h.compactCalls, 1);
-	assert.ok(h.threshold("manual", 100_000).compaction);
+	assert.equal(h.compactCalls, 0);
+	assert.ok((await reset).compaction);
 	h.fire("session_compact_failed", {
 		type: "session_compact_failed",
 		reason: "manual",
@@ -1116,12 +1174,9 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 		willRetry: false,
 		fromExtension: true,
 	});
-	const compactRequest = h.compactRequests.shift();
-	assert.ok(compactRequest);
-	compactRequest.onError?.(new Error("Compaction cancelled"));
 	assert.equal(h.coordinationStates.at(-1)?.phase, "rollover_pending");
 	h.fire("agent_settled", { type: "agent_settled" });
-	assert.equal(h.compactCalls, 1, "Esc must not retry compaction automatically");
+	assert.equal(h.compactCalls, 0, "Esc must not retry compaction automatically");
 	const retry = h.threshold("manual", 100_000);
 	assert.ok(retry.compaction, "a later explicit command reuses the saved checkpoint");
 	h.cleanup();
@@ -1131,7 +1186,7 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 // checkpoint, reopens tools, and requires a fresh checkpoint on the next command.
 {
 	const h = createHarness("manual-checkpoint-invalidated");
-	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const reset = h.beginManual();
 	const prompt = h.consumeSteer();
 	h.fire("message_end", {
 		type: "message_end",
@@ -1152,13 +1207,16 @@ process.env.PI_TOKEN_BUDGET_HARD_ROLLOVER_TOKENS = "180000";
 	);
 	h.setIdle(true);
 	h.fire("agent_settled", { type: "agent_settled" });
-	assert.ok(h.threshold("manual", 100_000).compaction);
-	h.failCompact("manual rollover failed");
+	assert.ok((await reset).compaction);
+	h.failCompact("manual rollover failed", true);
 	h.fire("message_end", { type: "message_end", message: { role: "user", content: "new work" } });
 	assert.equal(h.coordinationStates.at(-1)?.phase, "ready");
 	assert.equal(h.fire("tool_call", { type: "tool_call", toolCallId: "new-work", toolName: "bash", input: {} }), undefined);
-	assert.deepEqual(h.threshold("manual", 100_000), { cancel: true });
+	const retried = h.beginManual();
 	assert.equal(h.steering.at(-1)?.customType, CUSTOM_TYPE_MANUAL_CHECKPOINT);
+	h.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "aborted" } });
+	h.fire("agent_settled", { type: "agent_settled", aborted: true });
+	assert.deepEqual(await retried, { cancel: true });
 	h.cleanup();
 }
 

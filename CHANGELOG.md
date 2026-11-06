@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.2 — 2026-11-06
+
+- Fix the spurious `Compaction cancelled` error on successful manual `/compact`. The native compaction now waits for the checkpoint run to settle and completes in the same attempt. Preserve checkpoint fencing, Esc cancellation, saved-note retries, and fresh-window notes discovery; decline nested automatic compaction while the checkpoint is running.
+
 ## 2.0.1 — 2026-11-06
 
 - Remove provider-facing `encrypted` annotations from note writes and literal searches. Notes and search queries use ordinary string parameters; tool names, workflow guidance, and checkpoint fencing stay the same.

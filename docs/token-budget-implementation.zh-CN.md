@@ -106,11 +106,11 @@ journal 的记录文件保留旧条目，manifest 描述当前已提交分支。
 
 写入失败释放 claim，允许纠正后重试。schema/宿主层执行错误也通过 tool_result 释放未成功 claim。成功写入后自动请求 rollover，并返回 terminate=true。其他 agent 的 notes 写入不能解除该 fence。继续保留 continuation ownership 协议。
 
-用户手动 `/compact` 不受剩余预算阈值限制。Pi 准备出可压缩历史后，第一次 attempt 被取消，并启动 `manual-checkpoint` 控制回合。请求包含 requestId、windowId、phase（awaiting/saved/compacting）和有无已排队提示的状态。模型保存一次自己的 checkpoint 后，自动请求换窗，不需要再调用 new_context。
+用户手动 `/compact` 不受剩余预算阈值限制。Pi 准备出可压缩历史后，`session_before_compact` 返回 Promise，等待 `manual-checkpoint` 控制回合结束。请求包含 requestId、windowId、phase（awaiting/saved/compacting）和有无已排队提示的状态。模型保存一次自己的 checkpoint，工具 batch 结束并触发 `agent_settled` 后，原生压缩的同一次调用使用最新分支构建新窗口，不需要再调用 new_context，也不再通过“首次取消、再次压缩”实现正常流程。
 
-重复命令在首次提示投递前合并。Esc 取消尚未完成的请求，context 回调清除失效或重复控制消息。checkpoint 已保存但 compaction 失败时，下一次显式 `/compact` 可复用该 checkpoint；普通用户消息使它失效并重新开放工具。继续消息只恢复未完成工作；没有剩余任务时等待用户。真实 overflow 仍使用紧急直接换窗。Pi 对首次有意取消的 attempt 可能显示 `Compaction cancelled`；过短会话可能在扩展 hook 前就被判定不可压缩。
+重复命令在首次提示投递前合并。Esc 通过 compaction 的 AbortSignal 联动取消 checkpoint 模型回合，等待其 settled 后才退出；context 回调清除失效或重复控制消息。checkpoint 已保存但 compaction 失败时，下一次显式 `/compact` 可复用该 checkpoint；普通用户消息使它失效并重新开放工具。继续消息只恢复未完成工作；没有剩余任务时等待用户。手动 checkpoint 等待期间拒绝嵌套的 threshold/overflow compaction，并忽略这些被拒绝尝试的失败事件，防止它们重置成功笔记或提前替换上下文。其他时刻真实 overflow 仍使用紧急直接换窗。正常手动换窗没有中间取消错误；用户主动取消或 checkpoint 未保存时仍取消原生压缩，保留当前窗口。过短会话可能在扩展 hook 前就被判定不可压缩。
 
-主动 `new_context` 幂等设置 pendingNewContext，并返回 terminate=true。真正 rollover 在 eligible settled 边界执行；Pi 自动 compaction 也可先消费请求。没有调用流中 abort，没有改 Pi 私有状态，也没有修改 provider payload。
+主动 `new_context` 幂等设置 pendingNewContext，并返回 terminate=true。真正 rollover 在 eligible settled 边界执行；Pi 自动 compaction 也可先消费请求。只有用户取消手动压缩时，才用公开的 ctx.abort 联动取消其 checkpoint 回合；正常流程不打断请求。没有改 Pi 私有状态，也没有修改 provider payload。
 
 Pi agent-core 只有在**当前工具 batch 的所有 finalized results 都 terminate=true** 时才提前结束该 batch。混合普通工具时不能保证停止；steer/follow-up 队列也可能继续触发采样。已用真实 agent-core 离线测试固定这四种情况。插件层实现因此不能承诺与 Codex 相同的“下一次采样前必定换窗”。
 

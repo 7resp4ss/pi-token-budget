@@ -96,6 +96,7 @@ interface BeforeCompactEventLike {
 	reason: string;
 	branchEntries: unknown[];
 	preparation: { tokensBefore: number };
+	signal: AbortSignal;
 }
 
 /** Max lines in the bootstrap user-request index (most recent kept on overflow). */
@@ -169,6 +170,8 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 	let checkpointWriteClaimed = false;
 	/** User-initiated /compact choreography for the current window. */
 	let manualCheckpointRequest: ManualCheckpointRequest | null = null;
+	/** Keep the native manual compaction open until the checkpoint run settles. */
+	let manualCheckpointWait: { resolve(aborted: boolean): void } | null = null;
 	/** One-request compatibility guidance for sessions created with the former aggregate history tool. */
 	let historyMigrationHintPending = false;
 	/** Session id for coordination payloads; set on session_start. */
@@ -318,6 +321,44 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 			checkpointWriteClaimed = false;
 		}
 		coordination.publish();
+	}
+
+	async function checkpointBeforeManualRollover(event: BeforeCompactEventLike, ctx: ExtensionContext) {
+		const request = manualCheckpointRequest!;
+		let finish!: (aborted: boolean) => void;
+		const settled = new Promise<boolean>(resolve => { finish = resolve; });
+		const waiter = { resolve: finish };
+		manualCheckpointWait = waiter;
+		// The TUI's Esc handler aborts compaction. Also stop the checkpoint run,
+		// but wait for its tools to finish before letting native compaction exit.
+		const onAbort = () => ctx.abort();
+		event.signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			let aborted = event.signal.aborted;
+			if (!aborted) {
+				sendManualCheckpoint(ctx);
+				aborted = await settled;
+			}
+			if (manualCheckpointRequest !== request) return { cancel: true };
+			if (aborted || event.signal.aborted || !checkpointSaved || request.phase !== "saved") {
+				rolloverRequested = false;
+				state = { ...state, pendingNewContext: false };
+				if (aborted || event.signal.aborted) {
+					if (!checkpointSaved) cancelManualCheckpoint();
+				} else {
+					ctx.ui.notify("pi-token-budget: checkpoint was not saved; the current context window was kept. Retry /compact to try again.", "warning");
+				}
+				persist();
+				coordination.publish();
+				return { cancel: true };
+			}
+			// The original event predates the note and its tool result. Journal and
+			// bootstrap the current branch only after the checkpoint run has settled.
+			return buildRollover({ ...event, branchEntries: currentBranch(ctx) });
+		} finally {
+			event.signal.removeEventListener("abort", onAbort);
+			if (manualCheckpointWait === waiter) manualCheckpointWait = null;
+		}
 	}
 
 	/** Bounded recent-item index (id — role — preview) for checkpoint prompts. */
@@ -528,6 +569,8 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 	// Session lifecycle
 	// ---------------------------------------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
+		manualCheckpointWait?.resolve(true);
+		manualCheckpointWait = null;
 		subagentsRegistration?.dispose();
 		subagentsRegistration = undefined;
 		currentSessionId = ctx.sessionManager.getSessionId();
@@ -737,6 +780,9 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 	pi.on("session_before_compact", (event, ctx) => {
 		if (!bundle.defaults.enabled) return undefined;
 		const compactEvent = event as BeforeCompactEventLike;
+		// A checkpoint run can itself cross Pi's automatic threshold. Its native
+		// manual compaction owns the rollover; never compact inside that run.
+		if (manualCheckpointWait) return { cancel: true };
 
 		// Model-requested rollovers and emergency overflows must proceed directly.
 		if (
@@ -760,8 +806,7 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 					checkpointWriteClaimed = false;
 				}
 			}
-			sendManualCheckpoint(ctx);
-			return { cancel: true };
+			return checkpointBeforeManualRollover(compactEvent, ctx);
 		}
 
 		// While a user-requested checkpoint is pending, automatic threshold
@@ -859,6 +904,9 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 
 	pi.on("session_compact_failed", (event, _ctx) => {
 		if (!bundle.defaults.enabled) return;
+		// Nested automatic attempts were deliberately declined while the native
+		// manual attempt waits. They must not reset its checkpoint or intent.
+		if (manualCheckpointWait) return;
 		const activeManualRequest = manualCheckpointRequest?.windowId === state.currentWindowId ? manualCheckpointRequest : null;
 		const manualWasCompacting = activeManualRequest?.phase === "compacting";
 		const manualCheckpointWasSaved = activeManualRequest !== null && checkpointSaved;
@@ -877,8 +925,6 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 				checkpointSaved = manualCheckpointWasSaved;
 				checkpointWriteClaimed = manualCheckpointWasSaved;
 			}
-			// When the first /compact is intentionally cancelled to launch the
-			// checkpoint agent, preserve any concurrently delivered prompt or note.
 		} else {
 			// A session_before_compact { cancel: true } result is reported through
 			// this event with aborted=true. It only rejects that compact attempt;
@@ -903,7 +949,7 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 	// boundary, never mid-response.
 	// ---------------------------------------------------------------------
 	function startDeferredRollover(ctx: ExtensionContext): void {
-		if (compactionInFlight || !ctx.isIdle()) return;
+		if (manualCheckpointWait || compactionInFlight || !ctx.isIdle()) return;
 		compactionInFlight = true;
 		rolloverRequested = false;
 		coordination.publish();
@@ -917,9 +963,13 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 		});
 	}
 
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("agent_settled", (event, ctx) => {
 		if (!bundle.defaults.enabled) return;
 		syncHistory(ctx);
+		if (manualCheckpointWait) {
+			manualCheckpointWait.resolve((event as { aborted?: boolean }).aborted === true);
+			return;
+		}
 		if (
 			rolloverRequested &&
 			state.fallbackActive &&
@@ -971,6 +1021,8 @@ function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		manualCheckpointWait?.resolve(true);
+		manualCheckpointWait = null;
 		if (bundle.defaults.enabled) syncHistory(ctx);
 		subagentsRegistration?.dispose();
 		subagentsRegistration = undefined;

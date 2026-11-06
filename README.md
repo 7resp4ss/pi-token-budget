@@ -72,13 +72,13 @@ checkpoint saved ──► terminate tool batch ──► deferred rollover
 
 When Pi has enough history to prepare a compaction, its built-in `/compact` command is treated as an explicit save-and-rollover request, independent of the remaining-context threshold:
 
-1. The first native compaction attempt is cancelled and a dedicated checkpoint turn starts with recent item ids attached.
+1. The native compaction hook stays open while a dedicated checkpoint turn runs with recent item ids attached.
 2. The model may make exactly one successful `notes_write_file` or `notes_append_to_file` to its own notes; it does not need to call `new_context`.
-3. A successful write terminates that tool batch, retries compaction automatically, and resumes unfinished work in the fresh window. If the checkpoint records no unfinished work, the continuation waits for the user.
+3. A successful write terminates that tool batch. Once the checkpoint run settles, the same native compaction completes and resumes unfinished work in the fresh window. If the checkpoint records no unfinished work, the continuation waits for the user.
 
-Pressing Esc during the checkpoint turn cancels this manual request and stale checkpoint instructions are filtered from later model contexts. If the note succeeds but compaction itself fails, another `/compact` reuses that checkpoint; any normal user message invalidates it and reopens ordinary tools. Repeated `/compact` commands before prompt delivery collapse into one request. Pi currently renders the deliberately cancelled first attempt as `Compaction cancelled` before the checkpoint turn appears; this is a host-level UI consequence of intercepting the built-in command.
+Pressing Esc during the checkpoint turn cancels both the checkpoint run and this manual request; stale checkpoint instructions are filtered from later model contexts. If the note succeeds but compaction itself fails, another `/compact` reuses that checkpoint; any normal user message invalidates it and reopens ordinary tools. Repeated `/compact` commands before prompt delivery collapse into one request. A successful manual rollover completes without an intermediate `Compaction cancelled` error. If the checkpoint run ends without saving, the current window is kept and the checkpoint fence stays armed for a retry.
 
-An actual context overflow remains an emergency direct rollover because there may no longer be enough room for another model-authored checkpoint.
+Outside an active manual checkpoint, an actual context overflow remains an emergency direct rollover because there may no longer be enough room for another model-authored checkpoint. During a manual checkpoint, nested automatic compaction is declined so it cannot discard the context before the checkpoint run settles.
 
 ### Why this exists
 
@@ -136,7 +136,7 @@ Alternatives:
 
 ```bash
 # git (pinnable version)
-pi install git:github.com/7resp4ss/pi-token-budget@v2.0.1
+pi install git:github.com/7resp4ss/pi-token-budget@v2.0.2
 
 # Try without installing
 pi -e npm:pi-token-budget
