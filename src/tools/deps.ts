@@ -1,0 +1,163 @@
+/**
+ * Shared dependencies and helpers for all model-facing tools.
+ *
+ * ToolDeps is the seam between the orchestration layer (src/index.ts) and
+ * the individual tool implementations in this directory: tools never touch
+ * plugin state or pi session internals directly, they only see this
+ * interface. That keeps each tool file independently testable and
+ * self-documenting.
+ */
+
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { TokenBudgetConfig } from "../config.ts";
+import type { HistoryStore } from "../stores/history-store.ts";
+import type { NotesStore } from "../stores/notes-store.ts";
+import type { TaskRegistry } from "../task-registry.ts";
+import { Check } from "typebox/value";
+import type { TSchema } from "typebox";
+import { TOOL_SPECS } from "./specs.ts";
+import { charLength } from "../storage.ts";
+import type { WindowState } from "../state.ts";
+import { truncate } from "../stores/history-store.ts";
+
+/** Minimal pi surface tools need for registration. */
+export type ToolRegistrar = { registerTool(def: unknown): void };
+
+export interface ToolDeps {
+	config: TokenBudgetConfig;
+	/** Current window state (identity + one-shot flags). */
+	getState(): WindowState;
+	/** Set the pending rollover request and persist state. */
+	requestRollover(): void;
+	/** Whether a fallback/manual checkpoint fence is currently active. */
+	checkpointFenceActive(): boolean;
+	/** Release a failed checkpoint write so the model can retry it. */
+	releaseCheckpointWrite(): void;
+	/** Mark the checkpoint complete and request the deferred rollover. */
+	completeCheckpoint(): void;
+	/** Notes store for the active session. */
+	getNotes(): NotesStore;
+	/** History index built from the live session branch. */
+	buildHistory(ctx: ExtensionContext, agentName?: string | null): HistoryStore;
+	getTask(): TaskRegistry;
+	hardTriggerRemaining(ctx: ExtensionContext): number | null;
+	/**
+	 * Bounded recent-item index (id — role — preview) of the CURRENT window,
+	 * with the plugin's own bookkeeping messages filtered out. Used by the
+	 * reminder/fallback prompts and by the new_context confirmation so ids can be
+	 * copied into notes while the conversation is still visible.
+	 */
+	recentItemLines(ctx: ExtensionContext): string[];
+	/** Fire-and-forget rollover via pi's compaction pipeline (turn boundary only). */
+	triggerCompaction(ctx: ExtensionContext): void;
+	/** Remaining tokens from live context usage, or null when unknown. */
+	remainingTokens(ctx: ExtensionContext): number | null;
+}
+
+/** Build a tool result, truncated to the configured output cap. */
+export function textResult(text: string, config: TokenBudgetConfig): { content: Array<{ type: "text"; text: string }>; details: unknown } {
+	return {
+		content: [{ type: "text", text: truncate(text, config.maxToolOutputChars) }],
+		details: { tool: "pi-token-budget" },
+	};
+}
+
+/** Clamp an optional numeric argument into [min, max] with a fallback. */
+export function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+	const n = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+	return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * Soft bloat warnings for the notes checkpoint space. Checkpoints are
+ * designed to be concise (the recovery protocol reads them as a whole);
+ * these hints fire well before the hard cap so the model can prune or split
+ * while it still matters. Thresholds are derived from notesMaxFileBytes —
+ * per file cap/16 (≈64KB at 1MB), total cap/4 (≈256KB) — so there is nothing
+ * extra to configure. Primary channel: the budget reminder (guaranteed
+ * delivery); secondary channels: notes list and get_context_remaining.
+ * Bounded: at most 5 per-file lines + 1 total line. Returns [] when notes
+ * are unavailable (session not started).
+ */
+export function notesBloatWarnings(getNotes: () => NotesStore, config: TokenBudgetConfig): string[] {
+	const lines: string[] = [];
+	let stats: ReturnType<NotesStore["measureStats"]>;
+	try {
+		stats = getNotes().measureStats(5);
+	} catch {
+		return lines;
+	}
+	const fileWarn = Math.max(1, Math.floor(config.notesMaxFileBytes / 16));
+	const totalWarn = Math.max(1, Math.floor(config.notesMaxFileBytes / 4));
+	const oversized = stats.largestFiles.filter((f) => f.bytes > fileWarn);
+	for (const f of oversized) {
+		lines.push(
+			`⚠ note "${f.path}" is ${f.bytes} bytes (> ${fileWarn}): checkpoints work best concise — prune obsolete content or split the file before it approaches the ${config.notesMaxFileBytes} byte cap.`,
+		);
+	}
+	if (stats.totalBytes > totalWarn) {
+		lines.push(
+			`⚠ total notes size ${stats.totalBytes} bytes across ${stats.totalFiles} files (> ${totalWarn}): prune obsolete content with notes_write_file — recovery reads checkpoints, not archives.`,
+		);
+	}
+	return lines;
+}
+
+export function requiredString(value: unknown, name: string): string {
+	if (typeof value !== "string" || value.trim().length === 0) throw new Error(`${name} is required and cannot be blank`);
+	return value;
+}
+
+export function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+export function optionalInt(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : undefined;
+}
+
+/** Definitions remain independent even though registration/validation is shared. */
+export function defineTool(pi: ToolRegistrar, name: keyof typeof TOOL_SPECS,
+	execute: (params: Record<string, unknown>, ctx: ExtensionContext, toolCallId: string) => Promise<unknown>, onError?: () => void): void {
+	const spec = TOOL_SPECS[name];
+	pi.registerTool({
+		name, label: name, description: spec.description, parameters: spec.parameters,
+		executionMode: spec.executionMode,
+		async execute(_id: string, params: Record<string, unknown>, _signal: AbortSignal | undefined, _update: unknown, ctx: ExtensionContext) {
+			try {
+				if (!Check(spec.parameters as unknown as TSchema, params)) throw new Error(`Invalid parameters for ${name}; check required fields, types, ranges, and enum values.`);
+				const known = spec.parameters.properties;
+				const unknown = Object.keys(params).filter(key => !Object.hasOwn(known, key));
+				if (unknown.length) throw new Error(`Invalid parameters for ${name}: unknown field(s): ${unknown.join(", ")}`);
+				return await execute(params, ctx, _id);
+			} catch (error) { onError?.(); throw error; }
+		},
+	});
+}
+
+/** Lists stop on whole rows instead of cutting a serialized row in half. */
+export function rowsResult(rows: string[], config: TokenBudgetConfig, heading: string): ReturnType<typeof textResult> {
+	const cap = config.maxToolOutputChars;
+	const kept: string[] = [truncate(heading, cap)];
+	const omittedLine = (count: number) => `(${count} rows omitted by output cap; narrow the filter.)`;
+	let size = charLength(kept[0]);
+	for (let index = 0; index < rows.length; index++) {
+		const row = rows[index];
+		const reserve = index + 1 < rows.length ? charLength(omittedLine(rows.length - index - 1)) + 1 : 0;
+		if (size + charLength(row) + 1 + reserve > cap) break;
+		kept.push(row); size += charLength(row) + 1;
+	}
+	const omitted = rows.length - kept.length + 1;
+	if (omitted > 0 && size + charLength(omittedLine(omitted)) + 1 <= cap) kept.push(omittedLine(omitted));
+	return { content: [{ type: "text", text: kept.join("\n") }], details: { tool: "pi-token-budget" } };
+}
+
+/** Reads bypass blanket truncation: the caller has already bounded the body.
+ * The small addressing/range header must remain complete. */
+export function pageResult(text: string, details?: unknown) {
+	return { content: [{ type: "text" as const, text }], details: details ?? { tool: "pi-token-budget" } };
+}
+
+export function integerArg(params: Record<string, unknown>, name: string, fallback: number, cap = Number.MAX_SAFE_INTEGER): number {
+	return Math.min((params[name] as number | undefined) ?? fallback, cap);
+}

@@ -1,0 +1,79 @@
+{
+	"name": "pi-token-budget",
+	"version": "2.0.1",
+	"description": "No-summary context-window rollover for Pi with durable notes checkpoints, history recovery, and a checkpoint tool-call fence.",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi",
+		"coding-agent",
+		"codex",
+		"context",
+		"context-window",
+		"context-management",
+		"token-budget",
+		"compaction",
+		"llm",
+		"ai-agent",
+		"developer-tools"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/7resp4ss/pi-token-budget.git"
+	},
+	"homepage": "https://github.com/7resp4ss/pi-token-budget#readme",
+	"bugs": {
+		"url": "https://github.com/7resp4ss/pi-token-budget/issues"
+	},
+	"main": "src/index.ts",
+	"files": [
+		"src/*.ts",
+		"src/stores/*.ts",
+		"src/tools/*.ts",
+		"src/tools/README.md",
+		"docs/token-budget-implementation.zh-CN.md",
+		"docs/tool-prompts.zh-CN.md",
+		"docs/implementation-acceptance.zh-CN.md",
+		"docs/implementation-acceptance.json",
+		"CHANGELOG.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"smoke": "node --experimental-strip-types src/tests/smoke.ts",
+		"integration": "node --experimental-strip-types src/tests/integration.ts",
+		"contract": "node --experimental-strip-types src/tests/pi-agent-core-contract.ts",
+		"test": "npm run smoke && npm run integration && npm run contract && npm run coordination && npm run coordination-integration && npm run recovery && npm run sdk-context && npm run subagents-contract",
+		"coordination": "node --experimental-strip-types src/tests/coordination.ts",
+		"coordination-integration": "node --experimental-strip-types src/tests/coordination-integration.ts",
+		"recovery": "node --experimental-strip-types src/tests/recovery.ts",
+		"sdk-context": "node --experimental-strip-types src/tests/sdk-context.ts",
+		"subagents-contract": "node --experimental-strip-types src/tests/subagents-contract.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "0.84.4",
+		"@earendil-works/pi-coding-agent": "0.84.4",
+		"@types/node": "22.19.19",
+		"typebox": "1.3.7",
+		"typescript": "5.9.3"
+	},
+	"exports": {
+		".": "./src/index.ts",
+		"./api": "./src/api.ts"
+	}
+}

@@ -1,0 +1,991 @@
+/**
+ * pi-token-budget: token-budget context window management for pi.
+ *
+ * Replaces summarization compaction with no-summary window rollover:
+ *
+ * - get_context_remaining / new_context model tools (pull + deferred push)
+ * - one-shot threshold reminder and exhaustion fallback per window
+ * - notes: model-authored checkpoints that survive rollovers
+ * - history: read-only, bounded random access to prior windows
+ * - checkpoint tool-call fence after fallback or user /compact requests
+ *
+ * Design invariants:
+ * 1. The in-flight response is never interrupted: injections and rollovers
+ *    happen at request/turn boundaries only.
+ * 2. History is append-only; stale reminders stay stale (cache friendly).
+ * 3. Per-window injection is bounded: 1x identity/guidance + <=1x reminder
+ *    + <=1x fallback + bounded tool outputs. Rollover resets the budget.
+ * 4. Rollover carries no summary: the new window opens with a bootstrap
+ *    notice, fresh initial context, and the recovery protocol.
+ *
+ * Entry point: `export default function (pi: ExtensionAPI)`.
+ */
+
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { loadConfig, reminderThreshold, resolveForModel, type ConfigBundle, type TokenBudgetConfig } from "./config.ts";
+import { CoordinationHost } from "./coordination.ts";
+import { HistoryStore } from "./stores/history-store.ts";
+import { TaskRegistry, sessionStorageDir, type TaskContext } from "./task-registry.ts";
+import { HistoryJournal, type JournalEntry } from "./stores/history-journal.ts";
+import { projectItemIds } from "./context-projection.ts";
+import { attachSubagents, type SubagentsOptions } from "./subagents-adapter.ts";
+import { NotesStore, type NoteFileInfo } from "./stores/notes-store.ts";
+import {
+	BOOTSTRAP_MARKER,
+	CUSTOM_TYPE_CONTEXT_WINDOW,
+	CUSTOM_TYPE_CONTINUE,
+	CUSTOM_TYPE_FALLBACK,
+	CUSTOM_TYPE_MANUAL_CHECKPOINT,
+	CUSTOM_TYPE_REMINDER,
+	HISTORY_TOOL_MIGRATION_HINT,
+	bootstrapText,
+	continuationMessage,
+	fallbackMessage,
+	guidanceMessage,
+	manualCheckpointMessage,
+	injectSystemGuidance,
+	reminderMessage,
+} from "./prompts.ts";
+import {
+	commitRollover,
+	freshState,
+	inferFromBranch,
+	loadState,
+	saveState,
+	windowIdFor,
+	type PendingWindow,
+	type WindowState,
+} from "./state.ts";
+import { registerWindowTools } from "./tools/index.ts";
+import { TOOL_SPECS } from "./tools/specs.ts";
+import { notesBloatWarnings } from "./tools/deps.ts";
+
+interface LooseEntry {
+	id: string;
+	type: string;
+	summary?: string;
+	customType?: string;
+	content?: unknown;
+	details?: unknown;
+}
+
+type BudgetMessageKind = "reminder" | "fallback";
+
+interface BudgetMessageDetails {
+	windowId: string;
+	kind: BudgetMessageKind;
+}
+
+type ManualCheckpointPhase = "awaiting" | "saved" | "compacting";
+
+interface ManualCheckpointRequest {
+	requestId: string;
+	windowId: string;
+	phase: ManualCheckpointPhase;
+	promptQueued: boolean;
+}
+
+interface ManualCheckpointDetails {
+	windowId: string;
+	requestId: string;
+	kind: "manual-checkpoint";
+}
+
+interface BeforeCompactEventLike {
+	reason: string;
+	branchEntries: unknown[];
+	preparation: { tokensBefore: number };
+}
+
+/** Max lines in the bootstrap user-request index (most recent kept on overflow). */
+const USER_REQUEST_INDEX_LIMIT = 25;
+/** Max lines in the bootstrap recently-edited-files index (Claude Code re-reads 5). */
+const EDITED_FILE_INDEX_LIMIT = 5;
+/** Tool names whose `path` argument mutates a file and is worth indexing. */
+const FILE_EDIT_TOOL_NAMES = new Set(["edit", "write", "multiedit"]);
+
+const truncatePath = (p: string): string => (p.length > 160 ? `${p.slice(0, 157)}...` : p);
+
+export interface TokenBudgetOptions { task?: TaskContext; subagents?: SubagentsOptions }
+export function createTokenBudgetExtension(options: TokenBudgetOptions = {}) {
+	return (pi: ExtensionAPI): void => installTokenBudget(pi, options);
+}
+export default function tokenBudgetExtension(pi: ExtensionAPI): void { installTokenBudget(pi, {}); }
+
+function installTokenBudget(pi: ExtensionAPI, initialOptions: TokenBudgetOptions): void {
+	// Extension APIs have different object identities for ambient/generated
+	// entries. The session-local event bus is the public shared rendezvous.
+	const options = { ...initialOptions };
+	let duplicate = false;
+	pi.events.emit("pi-token-budget:installation:v1", { configure: options, respond: () => { duplicate = true; } });
+	if (duplicate) return;
+	pi.events.on("pi-token-budget:installation:v1", (request: unknown) => {
+		if (!request || typeof request !== "object") return;
+		const r = request as { configure?: TokenBudgetOptions; respond?: () => void };
+		if (r.configure?.task) {
+			if (task && (task.context.runId !== r.configure.task.runId || task.context.taskDir !== r.configure.task.taskDir)) throw new Error("Cannot change the task of an initialized session");
+			options.task = r.configure.task;
+		}
+		if (r.configure?.subagents) options.subagents = r.configure.subagents;
+		r.respond?.();
+	});
+	const bundle: ConfigBundle = loadConfig();
+	/** Effective config for the active model (memoized per provider/model). */
+	let modelConfigKey = "";
+	let modelConfig: TokenBudgetConfig = bundle.defaults;
+	function effectiveConfig(ctx: ExtensionContext): TokenBudgetConfig {
+		const model = ctx.model;
+		if (!model) return resolveForModel(bundle, undefined, undefined);
+		const key = `${model.provider}/${model.id}`;
+		if (key !== modelConfigKey) {
+			modelConfigKey = key;
+			modelConfig = resolveForModel(bundle, model.provider, model.id);
+		}
+		return modelConfig;
+	}
+
+	// ---------------------------------------------------------------------
+	// Mutable per-session state (reinitialized on session_start)
+	// ---------------------------------------------------------------------
+	let state: WindowState = freshState("pending-session");
+	let notes: NotesStore | null = null;
+	let sessionDir = "";
+	let task: TaskRegistry | null = null;
+	let journal: HistoryJournal | null = null;
+	let subagentsRegistration: { dispose(): void } | undefined;
+	/** Pending rollover awaiting commit by session_compact. */
+	let pendingWindow: PendingWindow | null = null;
+	/** Rollover request from new_context, awaiting the turn boundary. */
+	let rolloverRequested = false;
+	let compactionInFlight = false;
+	/** Timestamp (ms) of the last committed rollover; guards stale usage. */
+	let lastRolloverTimestamp = 0;
+	/** Continue the task in the new window after a model-initiated or forced rollover. */
+	let continueAfterRollover = false;
+	/** Checkpoint fence: only one notes write/append may pass. */
+	let checkpointFenceActive = false;
+	let checkpointSaved = false;
+	let checkpointWriteClaimed = false;
+	/** User-initiated /compact choreography for the current window. */
+	let manualCheckpointRequest: ManualCheckpointRequest | null = null;
+	/** One-request compatibility guidance for sessions created with the former aggregate history tool. */
+	let historyMigrationHintPending = false;
+	/** Session id for coordination payloads; set on session_start. */
+	let currentSessionId = "pending-session";
+
+	// ---------------------------------------------------------------------
+	// Continuation-ownership coordination (private protocol, see coordination.ts)
+	// ---------------------------------------------------------------------
+	const coordination = new CoordinationHost(
+		pi.events,
+		() => currentSessionId,
+		() => state.currentWindowId,
+		() => ({
+			enabled: bundle.defaults.enabled,
+			pendingWindow,
+			compactionInFlight,
+			checkpointRequired:
+				((state.fallbackActive || checkpointFenceActive) && !checkpointSaved) || manualCheckpointRequest?.phase === "awaiting",
+			pendingNewContext: state.pendingNewContext,
+			rolloverRequested: rolloverRequested || manualCheckpointRequest?.phase === "saved",
+		}),
+	);
+	coordination.listen();
+
+	pi.events.on("pi-token-budget:task:v1", (request: unknown) => {
+		const r = request as { respond?: (value: { context: TaskContext; agentName: string }) => void };
+		if (task && typeof r?.respond === "function") r.respond({ context: { ...task.context }, agentName: task.agent.agentName });
+	});
+
+	function windowIdentity() {
+		return { agentName: task?.agent.agentName ?? "/root", firstWindowId: state.firstWindowId, previousWindowId: state.previousWindowId, currentWindowId: state.currentWindowId, windowNumber: state.windowNumber };
+	}
+	function syncHistory(ctx: ExtensionContext): void {
+		journal?.sync(currentBranch(ctx) as JournalEntry[]);
+	}
+
+	function persist(): void {
+		if (sessionDir) saveState(sessionDir, state);
+	}
+
+	function requestRollover(): void {
+		state = { ...state, pendingNewContext: true };
+		rolloverRequested = true;
+		persist();
+		coordination.publish();
+	}
+
+	function currentBranch(ctx: ExtensionContext, fromId?: string): LooseEntry[] {
+		return ctx.sessionManager.getBranch(fromId) as unknown as LooseEntry[];
+	}
+
+	function injectPassive(piApi: ExtensionAPI, customType: string, content: string, display: boolean): void {
+		piApi.sendMessage(
+			{ customType, content, display, details: undefined },
+			{ triggerTurn: false },
+		);
+	}
+
+	function injectBudget(piApi: ExtensionAPI, customType: string, content: string, display: boolean, kind: BudgetMessageKind): void {
+		const details: BudgetMessageDetails = { windowId: state.currentWindowId, kind };
+		piApi.sendMessage(
+			{ customType, content, display, details },
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	}
+
+	function currentWindowHasMessage(
+		branch: LooseEntry[],
+		customType: string,
+		currentWindowId: string,
+		kind: BudgetMessageKind,
+	): boolean {
+		return branch.some((entry) => {
+			if (entry.type !== "custom_message" || entry.customType !== customType) return false;
+			const details = entry.details as Partial<BudgetMessageDetails> | undefined;
+			return details?.windowId === currentWindowId && details.kind === kind;
+		});
+	}
+
+	function sendReminder(ctx: ExtensionContext, remaining: number): void {
+		const activeNotes = notes;
+		injectBudget(
+			pi,
+			CUSTOM_TYPE_REMINDER,
+			reminderMessage(
+				state.currentWindowId,
+				remaining,
+				recentItemLines(ctx),
+				activeNotes ? notesBloatWarnings(() => activeNotes, bundle.defaults) : [],
+			),
+			false,
+			"reminder",
+		);
+	}
+
+	function sendFallback(ctx: ExtensionContext): void {
+		injectBudget(
+			pi,
+			CUSTOM_TYPE_FALLBACK,
+			fallbackMessage(state.currentWindowId, recentItemLines(ctx)),
+			false,
+			"fallback",
+		);
+	}
+
+	function isManualCheckpointDetails(value: unknown): value is ManualCheckpointDetails {
+		if (!value || typeof value !== "object") return false;
+		const details = value as Partial<ManualCheckpointDetails>;
+		return details.kind === "manual-checkpoint" && typeof details.windowId === "string" && typeof details.requestId === "string";
+	}
+
+	function newManualCheckpointRequest(): ManualCheckpointRequest {
+		return {
+			requestId: `manual-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`,
+			windowId: state.currentWindowId,
+			phase: "awaiting",
+			promptQueued: false,
+		};
+	}
+
+	function sendManualCheckpoint(ctx: ExtensionContext): void {
+		const request = manualCheckpointRequest;
+		if (!request || request.phase !== "awaiting" || request.promptQueued) return;
+		request.promptQueued = true;
+		const details: ManualCheckpointDetails = {
+			windowId: request.windowId,
+			requestId: request.requestId,
+			kind: "manual-checkpoint",
+		};
+		coordination.publish();
+		pi.sendMessage(
+			{
+				customType: CUSTOM_TYPE_MANUAL_CHECKPOINT,
+				content: manualCheckpointMessage(request.windowId, recentItemLines(ctx)),
+				display: false,
+				details,
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	}
+
+	function cancelManualCheckpoint(): void {
+		manualCheckpointRequest = null;
+		if (!state.fallbackActive) {
+			checkpointFenceActive = false;
+			checkpointSaved = false;
+			checkpointWriteClaimed = false;
+		}
+		coordination.publish();
+	}
+
+	/** Bounded recent-item index (id — role — preview) for checkpoint prompts. */
+	function recentItemLines(ctx: ExtensionContext): string[] {
+		const items = new HistoryStore(currentBranch(ctx)).listItems({
+			scope: "task",
+			kind: "all",
+			recentFirst: true,
+			limit: 25,
+			previewChars: 120,
+		});
+		return items
+			.reverse() // chronological order for readability
+			.map((i) => `${i.itemId} — ${i.role} — ${i.preview.replace(/\s+/g, " ")} (window ${i.windowId})`);
+	}
+
+	/**
+	 * Cumulative user-request index (id — preview) across ALL windows in the
+	 * session tree, embedded in every bootstrap. System-guaranteed so the new
+	 * window can never lose sight of what the user asked for, even when the
+	 * model never recorded ids in notes. When the index overflows it keeps the
+	 * MOST RECENT requests (the newest is the one most likely still being
+	 * solved) and points at history for the omitted older ones.
+	 */
+	function userRequestLines(branch: Array<{ id: string; type: string; summary?: string; customType?: string }>): string[] {
+		const userIds = new Set(branch.filter(e => e.type === "message" && (e as { message?: { role?: string } }).message?.role === "user").map(e => e.id));
+		const items = new HistoryStore(branch as never).listItems({
+			role: "user",
+			scope: "task",
+			kind: "message",
+			recentFirst: false,
+			previewChars: 160,
+		}).filter(i => userIds.has(i.itemId));
+		const omitted = Math.max(0, items.length - USER_REQUEST_INDEX_LIMIT);
+		const kept = omitted > 0 ? items.slice(-USER_REQUEST_INDEX_LIMIT) : items;
+		const lines = kept.map((i) => `${i.itemId} — ${i.preview.replace(/\s+/g, " ")} (window ${i.windowId})`);
+		if (omitted > 0) {
+			lines.unshift(
+				`(${omitted} older user request(s) not shown — list them with history_list_items role "user", then read_item by id)`,
+			);
+		}
+		return lines;
+	}
+
+	/**
+	 * Bounded index of files edited via edit/write tool calls across ALL
+	 * windows, embedded in every bootstrap. The file analog of the user-request
+	 * index: system-guaranteed so the new window knows which files were being
+	 * changed even when the model never recorded them in notes. Each line
+	 * carries the item id of the most recent edit; history read_item recovers
+	 * the exact change. Pull-based paths and ids are re-read on demand rather
+	 * than being injected into every fresh window.
+	 */
+	function editedFileLines(branch: LooseEntry[]): string[] {
+		const touches: Array<{ path: string; itemId: string }> = [];
+		for (const entry of branch) {
+			if (entry.type !== "message") continue;
+			const msg = (entry as { message?: { role?: string; content?: unknown } }).message;
+			if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+			for (const block of msg.content as Array<Record<string, unknown>>) {
+				if (!block || typeof block !== "object" || block.type !== "toolCall") continue;
+				const name = typeof block.name === "string" ? block.name.toLowerCase() : "";
+				if (!FILE_EDIT_TOOL_NAMES.has(name)) continue;
+				const args = (block.arguments ?? block.input ?? {}) as Record<string, unknown>;
+				const p = typeof args.path === "string" ? args.path.trim() : "";
+				if (p) touches.push({ path: p, itemId: entry.id });
+			}
+		}
+		if (touches.length === 0) return [];
+		// Dedupe by path keeping the most recent touch, order by recency.
+		const lastTouch = new Map<string, { path: string; itemId: string; seq: number }>();
+		touches.forEach((t, i) => lastTouch.set(t.path, { ...t, seq: i }));
+		const recent = [...lastTouch.values()].sort((a, b) => b.seq - a.seq); // newest first
+		const lines = recent
+			.slice(0, EDITED_FILE_INDEX_LIMIT)
+			.reverse() // chronological order for readability
+			.map((t) => `${truncatePath(t.path)} (last edit: ${t.itemId})`);
+		const omitted = recent.length - Math.min(recent.length, EDITED_FILE_INDEX_LIMIT);
+		if (omitted > 0) {
+			lines.unshift(
+				`(${omitted} other file(s) also edited — recover those edits with history_search_contents "[tool_call", or list_items role "assistant")`,
+			);
+		}
+		return lines;
+	}
+
+	function needsHistoryMigrationHint(branch: LooseEntry[]): boolean {
+		const guidance = branch.flatMap((entry) => {
+			if (entry.type === "custom_message" && entry.customType === CUSTOM_TYPE_CONTEXT_WINDOW && typeof entry.content === "string") {
+				return [entry.content];
+			}
+			if (entry.type === "compaction" && typeof entry.summary === "string" && entry.summary.includes(BOOTSTRAP_MARKER)) {
+				return [entry.summary];
+			}
+			return [];
+		});
+		const effective = guidance.at(-1);
+		return effective !== undefined && /\b(?:single history tool|history tool|notes tool)\b|history with (?:the )?operation|"operation"\s*:\s*"(?:list_items|search_contents|read_item)"/.test(effective);
+	}
+
+	/** Whether the current window already has its identity/guidance message. */
+	function windowHasGuidance(branch: LooseEntry[]): boolean {
+		let lastCompaction = -1;
+		for (let i = 0; i < branch.length; i++) {
+			if (branch[i].type === "compaction") lastCompaction = i;
+		}
+		const compaction = lastCompaction >= 0 ? branch[lastCompaction] : undefined;
+		if (compaction && typeof compaction.summary === "string" && compaction.summary.includes(BOOTSTRAP_MARKER)) {
+			// Only rollover bootstraps carry this plugin's guidance. Pi-native
+			// summaries must still receive the first-window guidance message.
+			return true;
+		}
+		for (let i = lastCompaction + 1; i < branch.length; i++) {
+			if (branch[i].type === "custom_message" && branch[i].customType === CUSTOM_TYPE_CONTEXT_WINDOW) return true;
+		}
+		return false;
+	}
+
+	function buildRollover(event: BeforeCompactEventLike) {
+		journal?.sync(event.branchEntries as JournalEntry[]);
+		// Latch the continuation owner at rollover start: this rollover's
+		// generic-continuation suppression depends only on this snapshot; a
+		// later release only affects future rollovers.
+		coordination.latchRolloverOwner();
+		// Model-, fallback-, and user-requested rollovers resume automatically.
+		// A bare emergency overflow without one of those intents stays passive.
+		const manualContinuation = manualCheckpointRequest?.windowId === state.currentWindowId;
+		continueAfterRollover = state.pendingNewContext || state.fallbackActive || manualContinuation;
+		if (manualContinuation && manualCheckpointRequest) manualCheckpointRequest.phase = "compacting";
+
+		pendingWindow = { id: windowIdFor(state.windowNumber + 1), number: state.windowNumber + 1 };
+		const identity = {
+			agentName: task?.agent.agentName,
+			firstWindowId: state.firstWindowId,
+			previousWindowId: state.currentWindowId,
+			currentWindowId: pendingWindow.id,
+			windowNumber: pendingWindow.number,
+		};
+		const branch = event.branchEntries as LooseEntry[];
+		let noteFiles: NoteFileInfo[] | undefined;
+		try { noteFiles = notes?.listFiles(undefined, undefined, "updated_at", "descending"); }
+		catch { /* A listing failure must not block rollover; bootstrap offers tool discovery. */ }
+		const rollover = {
+			compaction: {
+				summary: bootstrapText(identity, userRequestLines(branch), editedFileLines(branch), noteFiles),
+				// Sentinel id that matches no entry: the new window keeps nothing
+				// from the old conversation (pi keeps entries from this id only).
+				firstKeptEntryId: `token-budget-rollover-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+				tokensBefore: event.preparation.tokensBefore,
+			},
+		};
+		// pendingWindow is set and the owner latched: publish rolling_over.
+		coordination.publish();
+		return rollover;
+	}
+
+	// ---------------------------------------------------------------------
+	// Tools
+	// ---------------------------------------------------------------------
+	if (bundle.defaults.enabled) {
+		registerWindowTools(pi, {
+			config: bundle.defaults,
+			getState: () => state,
+			requestRollover,
+			checkpointFenceActive: () => checkpointFenceActive && !checkpointSaved,
+			releaseCheckpointWrite: () => {
+				checkpointWriteClaimed = false;
+			},
+			completeCheckpoint: () => {
+				if (!checkpointFenceActive || checkpointSaved) return;
+				checkpointSaved = true;
+				checkpointWriteClaimed = true;
+				if (manualCheckpointRequest?.windowId === state.currentWindowId && manualCheckpointRequest.phase === "awaiting") {
+					manualCheckpointRequest.phase = "saved";
+				}
+				requestRollover();
+			},
+			getNotes: () => {
+				if (!notes) throw new Error("session not initialized yet");
+				return notes;
+			},
+			getTask: () => { if (!task) throw new Error("session not initialized yet"); return task; },
+			buildHistory: (ctx: ExtensionContext, agentName?: string | null) => {
+				if (!task) throw new Error("session not initialized yet");
+				const target = task.resolve(agentName);
+				if (target.agentName === task.agent.agentName) { syncHistory(ctx); return new HistoryStore(currentBranch(ctx)); }
+				return new HistoryStore(new HistoryJournal(target).readBranch());
+			},
+			hardTriggerRemaining: (ctx: ExtensionContext) => {
+				const usage = ctx.getContextUsage();
+				const hard = effectiveConfig(ctx).hardRolloverUsedTokens;
+				return !usage || usage.tokens === null || hard <= 0 ? null : Math.max(0, hard - usage.tokens);
+			},
+			recentItemLines: (ctx: ExtensionContext) => recentItemLines(ctx),
+			triggerCompaction: (ctx: ExtensionContext) => {
+				startDeferredRollover(ctx);
+			},
+			remainingTokens: (ctx: ExtensionContext) => {
+				const usage = ctx.getContextUsage();
+				if (!usage || usage.tokens === null || usage.contextWindow <= 0) return null;
+				return Math.max(0, usage.contextWindow - usage.tokens);
+			},
+		});
+	}
+
+
+	// ---------------------------------------------------------------------
+	// Session lifecycle
+	// ---------------------------------------------------------------------
+	pi.on("session_start", async (_event, ctx) => {
+		subagentsRegistration?.dispose();
+		subagentsRegistration = undefined;
+		currentSessionId = ctx.sessionManager.getSessionId();
+		coordination.resetSession();
+		if (!bundle.defaults.enabled) {
+			// Coordination still announces itself so clients can distinguish
+			// "installed but disabled" from "not installed".
+			coordination.publish();
+			return;
+		}
+		sessionDir = sessionStorageDir(ctx.sessionManager.getSessionDir());
+		lastRolloverTimestamp = 0;
+		modelConfigKey = "";
+		modelConfig = bundle.defaults;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const branch = currentBranch(ctx);
+		historyMigrationHintPending = needsHistoryMigrationHint(branch);
+		const loaded = loadState(sessionDir, sessionId);
+		state = loaded.sessionId === sessionId ? inferFromBranch(loaded, branch) : freshState(sessionId);
+		task = new TaskRegistry({ sessionDir, sessionId, sessionFile: ctx.sessionManager.getSessionFile?.() ?? undefined, task: options.task });
+		journal = new HistoryJournal(task.agent);
+		notes = new NotesStore(sessionDir, sessionId, bundle.defaults.notesMaxFileBytes, task.agent.notesRoot);
+		pendingWindow = null;
+		rolloverRequested = false;
+		compactionInFlight = false;
+		continueAfterRollover = false;
+		manualCheckpointRequest = null;
+		checkpointFenceActive = currentWindowHasMessage(branch, CUSTOM_TYPE_FALLBACK, state.currentWindowId, "fallback");
+		checkpointSaved = false;
+		checkpointWriteClaimed = false;
+		persist();
+		coordination.publish();
+
+		// First-window guidance (later windows bootstrap via the rollover summary).
+		if (!windowHasGuidance(branch)) {
+			injectPassive(
+				pi,
+				CUSTOM_TYPE_CONTEXT_WINDOW,
+				guidanceMessage(windowIdentity()),
+				false,
+			);
+		}
+		syncHistory(ctx);
+		try { subagentsRegistration = await attachSubagents(pi, task, options.subagents); }
+		catch (error) { ctx.ui.notify(`pi-token-budget: child-extension integration unavailable: ${String(error)}. Use createTokenBudgetExtension({ task }) in your child launcher or combine required extensions in the owning registration.`, "warning"); }
+	});
+
+	let lastMissingTools = "";
+	pi.on("before_agent_start", (event, ctx) => {
+		if (!bundle.defaults.enabled) return;
+		if (pi.getActiveTools) {
+			const active = new Set(pi.getActiveTools());
+			const missing = Object.keys(TOOL_SPECS).filter(t => !active.has(t)).join(", ");
+			if (missing && missing !== lastMissingTools) ctx.ui.notify(`pi-token-budget: recovery tools excluded by host policy: ${missing}. Add the eleven tool names to the agent's tools whitelist; this extension does not override capability policy.`, "warning");
+			lastMissingTools = missing;
+		}
+		return { systemPrompt: injectSystemGuidance(event.systemPrompt, bundle.defaults.notesMaxFileBytes) };
+	});
+	pi.on("context", (event, ctx) => {
+		if (!bundle.defaults.enabled) return;
+		syncHistory(ctx);
+		const request = manualCheckpointRequest;
+		const manualIndexes: number[] = [];
+		for (let index = 0; index < event.messages.length; index++) {
+			const message = event.messages[index] as AgentMessage & { customType?: string; details?: unknown };
+			if (message.role !== "custom" || message.customType !== CUSTOM_TYPE_MANUAL_CHECKPOINT) continue;
+			const details = isManualCheckpointDetails(message.details) ? message.details : undefined;
+			if (request && details?.windowId === request.windowId && details.requestId === request.requestId) manualIndexes.push(index);
+		}
+		const activeManualIndex = manualIndexes.at(-1);
+		let messages = event.messages.filter((message, index) => {
+			const candidate = message as AgentMessage & { customType?: string };
+			return candidate.role !== "custom" || candidate.customType !== CUSTOM_TYPE_MANUAL_CHECKPOINT || index === activeManualIndex;
+		});
+		if (historyMigrationHintPending) {
+			historyMigrationHintPending = false;
+			const migrationMessage: AgentMessage = {
+				role: "custom", customType: `${CUSTOM_TYPE_CONTEXT_WINDOW}:history-migration`,
+				content: HISTORY_TOOL_MIGRATION_HINT, display: false, timestamp: Date.now(),
+			};
+			messages = [...messages, migrationMessage];
+		}
+		const identity = guidanceMessage(windowIdentity());
+		const projected = projectItemIds(messages, currentBranch(ctx), identity);
+		// Refresh identity even when Pi compacts within an active run.
+		if (!projected.some(m => m.role === "custom" && m.customType === CUSTOM_TYPE_CONTEXT_WINDOW)) {
+			const firstConversation = projected.findIndex(m => !["system", "developer"].includes(m.role));
+			projected.splice(firstConversation < 0 ? projected.length : firstConversation, 0, { role: "custom", customType: CUSTOM_TYPE_CONTEXT_WINDOW, content: identity, display: false, timestamp: 0 });
+		}
+		return { messages: projected };
+	});
+
+	// ---------------------------------------------------------------------
+	// Trigger channel: one-shot reminder at the remaining-token threshold,
+	// plus an optional absolute hard rollover (used-tokens level) that forces
+	// the no-summary rollover at the next turn boundary. Both fire only after
+	// an assistant message completes — never mid-response.
+	// ---------------------------------------------------------------------
+	pi.on("message_end", (event, ctx) => {
+		if (!bundle.defaults.enabled) return;
+		syncHistory(ctx);
+		const msg = event.message as {
+			role?: string;
+			stopReason?: string;
+			timestamp?: number;
+			customType?: string;
+			details?: unknown;
+		};
+		const budgetDetails = msg.details as Partial<BudgetMessageDetails> | undefined;
+		if (
+			msg?.role === "custom" &&
+			msg.customType === CUSTOM_TYPE_FALLBACK &&
+			(!budgetDetails?.windowId || budgetDetails.windowId === state.currentWindowId) &&
+			(!budgetDetails?.kind || budgetDetails.kind === "fallback")
+		) {
+			checkpointFenceActive = true;
+			checkpointSaved = false;
+			checkpointWriteClaimed = false;
+			coordination.publish();
+			return;
+		}
+		if (msg?.role === "custom" && msg.customType === CUSTOM_TYPE_MANUAL_CHECKPOINT && isManualCheckpointDetails(msg.details)) {
+			const request = manualCheckpointRequest;
+			if (request && msg.details.windowId === request.windowId && msg.details.requestId === request.requestId) {
+				request.promptQueued = false;
+				checkpointFenceActive = true;
+				checkpointSaved = false;
+				checkpointWriteClaimed = false;
+				coordination.publish();
+			}
+			return;
+		}
+		if (
+			msg?.role === "user" &&
+			manualCheckpointRequest?.phase === "saved" &&
+			pendingWindow === null &&
+			!compactionInFlight &&
+			!state.pendingNewContext &&
+			!rolloverRequested
+		) {
+			cancelManualCheckpoint();
+			return;
+		}
+		if (msg?.role === "assistant" && msg.stopReason === "aborted" && manualCheckpointRequest) {
+			if (manualCheckpointRequest.phase === "awaiting") {
+				cancelManualCheckpoint();
+			} else if (manualCheckpointRequest.phase === "saved") {
+				// The note is durable, but Esc cancels the automatic rollover. Keep it
+				// reusable for a later explicit /compact unless normal work resumes.
+				rolloverRequested = false;
+				state = { ...state, pendingNewContext: false };
+				manualCheckpointRequest.promptQueued = false;
+				persist();
+				coordination.publish();
+			}
+			return;
+		}
+		if (msg?.role !== "assistant" || msg.stopReason === "aborted") return;
+		// Skip messages from before the last rollover: their usage reflects the
+		// discarded window and must not re-trigger anything (mirrors pi's own
+		// assistantIsFromBeforeCompaction guard).
+		if (msg.timestamp !== undefined && msg.timestamp <= lastRolloverTimestamp) return;
+		if (state.pendingNewContext) return;
+		const usage = ctx.getContextUsage();
+		if (!usage || usage.tokens === null || usage.contextWindow <= 0) return;
+		const eff = effectiveConfig(ctx);
+		const used = usage.tokens;
+		const remaining = Math.max(0, usage.contextWindow - used);
+
+		// Hard rollover: absolute used-tokens level, with hysteresis latch.
+		const hard = eff.hardRolloverUsedTokens;
+		if (hard > 0) {
+			if (used < hard * 0.9) {
+				if (state.hardRolloverLatched) {
+					state = { ...state, hardRolloverLatched: false };
+					persist();
+				}
+			} else if (used >= hard && !state.hardRolloverLatched && !state.fallbackActive) {
+				state = {
+					...state,
+					reminderDelivered: true,
+					fallbackDelivered: true,
+					fallbackActive: true,
+					hardRolloverLatched: true,
+				};
+				persist();
+				sendFallback(ctx);
+				rolloverRequested = true; // consumed at agent_settled
+				coordination.publish();
+				return;
+			}
+		}
+
+		if (state.reminderDelivered) return;
+		const threshold = reminderThreshold(eff, usage.contextWindow);
+		if (remaining > threshold) return;
+		state = { ...state, reminderDelivered: true };
+		persist();
+		sendReminder(ctx, remaining);
+	});
+
+	// ---------------------------------------------------------------------
+	// Rollover: intercept every compaction and replace summarization with a
+	// no-summary fresh window (except the first threshold crossing, which
+	// cancels once to give the model the fallback checkpoint prompt).
+	// ---------------------------------------------------------------------
+	pi.on("session_before_compact", (event, ctx) => {
+		if (!bundle.defaults.enabled) return undefined;
+		const compactEvent = event as BeforeCompactEventLike;
+
+		// Model-requested rollovers and emergency overflows must proceed directly.
+		if (
+			state.pendingNewContext ||
+			(compactionInFlight && (!checkpointFenceActive || checkpointSaved)) ||
+			compactEvent.reason === "overflow"
+		) {
+			return buildRollover(compactEvent);
+		}
+
+		if (compactEvent.reason === "manual") {
+			const currentRequest = manualCheckpointRequest?.windowId === state.currentWindowId ? manualCheckpointRequest : null;
+			if (currentRequest?.phase === "saved" || currentRequest?.phase === "compacting") {
+				return buildRollover(compactEvent);
+			}
+			if (!currentRequest) {
+				manualCheckpointRequest = newManualCheckpointRequest();
+				if (!state.fallbackActive) {
+					checkpointFenceActive = false;
+					checkpointSaved = false;
+					checkpointWriteClaimed = false;
+				}
+			}
+			sendManualCheckpoint(ctx);
+			return { cancel: true };
+		}
+
+		// While a user-requested checkpoint is pending, automatic threshold
+		// compaction must not bypass it. If its prompt never entered the branch,
+		// queue it again; otherwise wait for a successful notes write.
+		if (manualCheckpointRequest?.windowId === state.currentWindowId) {
+			if (manualCheckpointRequest.phase === "saved") return buildRollover(compactEvent);
+			if (manualCheckpointRequest.phase === "awaiting") {
+				if (!checkpointFenceActive) sendManualCheckpoint(ctx);
+				return { cancel: true };
+			}
+		}
+
+		const branch = compactEvent.branchEntries as LooseEntry[];
+		const fallbackInBranch = currentWindowHasMessage(
+			branch,
+			CUSTOM_TYPE_FALLBACK,
+			state.currentWindowId,
+			"fallback",
+		);
+		if (fallbackInBranch) {
+			if (checkpointFenceActive && !checkpointSaved) return { cancel: true };
+			if (!state.fallbackActive || !state.fallbackDelivered) {
+				state = { ...state, reminderDelivered: true, fallbackDelivered: true, fallbackActive: true };
+				persist();
+				coordination.publish();
+			}
+			return buildRollover(compactEvent);
+		}
+
+		if (state.fallbackActive) {
+			// The fallback was armed but never reached the branch (for example Esc
+			// cleared an in-memory queue). Re-offer it before any rollover.
+			sendFallback(ctx);
+			return { cancel: true };
+		}
+
+		const reminderInBranch = currentWindowHasMessage(
+			branch,
+			CUSTOM_TYPE_REMINDER,
+			state.currentWindowId,
+			"reminder",
+		);
+		if (!reminderInBranch) {
+			state = { ...state, reminderDelivered: true };
+			persist();
+			const usage = ctx.getContextUsage();
+			const remaining = usage?.tokens === null || !usage ? 0 : Math.max(0, usage.contextWindow - usage.tokens);
+			sendReminder(ctx, remaining);
+			return { cancel: true };
+		}
+
+		state = { ...state, reminderDelivered: true, fallbackDelivered: true, fallbackActive: true };
+		persist();
+		coordination.publish();
+		sendFallback(ctx);
+		return { cancel: true };
+	});
+
+	pi.on("session_compact", (event, ctx) => {
+		if (!bundle.defaults.enabled) return;
+		const summary = (event.compactionEntry as { summary?: string; timestamp?: string } | undefined)?.summary;
+		if (typeof summary !== "string" || !summary.includes(BOOTSTRAP_MARKER) || !pendingWindow) return;
+		const entryTs = (event.compactionEntry as { timestamp?: string }).timestamp;
+		if (entryTs) lastRolloverTimestamp = new Date(entryTs).getTime() || 0;
+		const previous = state.windowNumber;
+		const previousWindowId = state.currentWindowId;
+		state = commitRollover(state, pendingWindow);
+		pendingWindow = null;
+		rolloverRequested = false;
+		compactionInFlight = false;
+		manualCheckpointRequest = null;
+		checkpointFenceActive = false;
+		checkpointSaved = false;
+		checkpointWriteClaimed = false;
+		persist();
+		// Commit and persist first, then announce readiness, and only then
+		// decide the continuation: the owner (if latched) resumes instead of
+		// the generic continuation message.
+		coordination.publish({ previousWindowId });
+		if (continueAfterRollover) {
+			continueAfterRollover = false;
+			if (!coordination.suppressGenericContinuation()) {
+				// Compaction normally commits between turns. If pi completes it while
+				// still streaming, preserve steering delivery instead of follow-up.
+				pi.sendMessage(
+					{ customType: CUSTOM_TYPE_CONTINUE, content: continuationMessage(state.windowNumber), display: false, details: undefined },
+					ctx.isIdle() ? { triggerTurn: true } : { triggerTurn: true, deliverAs: "steer" },
+				);
+			}
+		}
+		coordination.clearRolloverOwnerLatch();
+		console.log(`pi-token-budget: context window reset ${previous} -> ${state.windowNumber} (id ${state.currentWindowId})`);
+	});
+
+	pi.on("session_compact_failed", (event, _ctx) => {
+		if (!bundle.defaults.enabled) return;
+		const activeManualRequest = manualCheckpointRequest?.windowId === state.currentWindowId ? manualCheckpointRequest : null;
+		const manualWasCompacting = activeManualRequest?.phase === "compacting";
+		const manualCheckpointWasSaved = activeManualRequest !== null && checkpointSaved;
+		pendingWindow = null;
+		compactionInFlight = false;
+		continueAfterRollover = false;
+		if (activeManualRequest) {
+			if (manualWasCompacting) {
+				// A user-requested rollover never retries behind Esc or a real failure.
+				// Keep a successful checkpoint reusable for an explicit /compact retry;
+				// normal user activity invalidates it in message_end.
+				rolloverRequested = false;
+				state = { ...state, pendingNewContext: false };
+				activeManualRequest.phase = manualCheckpointWasSaved ? "saved" : "awaiting";
+				activeManualRequest.promptQueued = false;
+				checkpointSaved = manualCheckpointWasSaved;
+				checkpointWriteClaimed = manualCheckpointWasSaved;
+			}
+			// When the first /compact is intentionally cancelled to launch the
+			// checkpoint agent, preserve any concurrently delivered prompt or note.
+		} else {
+			// A session_before_compact { cancel: true } result is reported through
+			// this event with aborted=true. It only rejects that compact attempt;
+			// the hard/new-context rollover intent must survive for agent_settled.
+			if (!event.aborted) {
+				rolloverRequested = false;
+				state = { ...state, pendingNewContext: false };
+			}
+			checkpointSaved = false;
+			checkpointWriteClaimed = false;
+		}
+		coordination.clearRolloverOwnerLatch();
+		persist();
+		const errorMessage = event.errorMessage;
+		coordination.publish(errorMessage !== undefined ? { error: errorMessage } : {});
+		// Keep checkpointFenceActive armed after a real failure. Fallbacks require
+		// a rewritten checkpoint; manual requests may reuse one already saved.
+	});
+
+	// ---------------------------------------------------------------------
+	// Deferred rollover for model-requested new_context: run at the turn
+	// boundary, never mid-response.
+	// ---------------------------------------------------------------------
+	function startDeferredRollover(ctx: ExtensionContext): void {
+		if (compactionInFlight || !ctx.isIdle()) return;
+		compactionInFlight = true;
+		rolloverRequested = false;
+		coordination.publish();
+		ctx.compact({
+			onComplete: () => {
+				compactionInFlight = false;
+			},
+			onError: (err: Error) => {
+				ctx.ui.notify(`pi-token-budget: rollover failed: ${err.message}`, "warning");
+			},
+		});
+	}
+
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!bundle.defaults.enabled) return;
+		syncHistory(ctx);
+		if (
+			rolloverRequested &&
+			state.fallbackActive &&
+			!currentWindowHasMessage(currentBranch(ctx), CUSTOM_TYPE_FALLBACK, state.currentWindowId, "fallback")
+		) {
+			// A hard rollover may be armed below pi's own threshold. If Esc removed
+			// its steer, re-send it here; the next settled boundary will compact
+			// after the fallback has actually entered the branch.
+			sendFallback(ctx);
+			return;
+		}
+		if (checkpointFenceActive && !checkpointSaved) return;
+		if (rolloverRequested || state.pendingNewContext) startDeferredRollover(ctx);
+	});
+
+	// Once a checkpoint request enters the branch, isolate the model at that
+	// boundary. The in-flight response is left untouched; this hook only
+	// controls subsequent tool execution.
+	pi.on("tool_call", (event) => {
+		if (!checkpointFenceActive) return undefined;
+		const tool = event as unknown as { toolName?: string; input?: Record<string, unknown> };
+		const toolName = tool.toolName ?? "";
+		if (checkpointSaved && toolName === "new_context") return undefined;
+		if (checkpointSaved) {
+			return {
+				block: true,
+				terminate: true,
+				reason: "Checkpoint already saved; the context window rollover is pending.",
+			};
+		}
+		if ((toolName === "notes_write_file" || toolName === "notes_append_to_file") && !checkpointWriteClaimed && !checkpointSaved) {
+			try {
+				const target = task?.resolveNote(typeof tool.input?.path === "string" ? tool.input.path : undefined);
+				if (target?.agent.agentName === task?.agent.agentName) { checkpointWriteClaimed = true; return undefined; }
+			} catch {
+				// Let the tool validate malformed paths and release its claim for retry.
+				if (typeof tool.input?.path === "string" && !tool.input.path.startsWith("/")) { checkpointWriteClaimed = true; return undefined; }
+			}
+		}
+		return {
+			block: true,
+			terminate: true,
+			reason: "Checkpoint required: only one notes_write_file or notes_append_to_file to the current agent's own notes is allowed before the context window rolls over.",
+		};
+	});
+
+	pi.on("tool_result", (event) => {
+		if (checkpointFenceActive && !checkpointSaved && event.isError && (event.toolName === "notes_write_file" || event.toolName === "notes_append_to_file")) checkpointWriteClaimed = false;
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		if (bundle.defaults.enabled) syncHistory(ctx);
+		subagentsRegistration?.dispose();
+		subagentsRegistration = undefined;
+		pendingWindow = null;
+		rolloverRequested = false;
+		compactionInFlight = false;
+		continueAfterRollover = false;
+		manualCheckpointRequest = null;
+		checkpointFenceActive = false;
+		checkpointSaved = false;
+		checkpointWriteClaimed = false;
+		// Clear the active claim so a stale owner cannot block later
+		// continuations after reload/replacement. Surviving runs re-claim
+		// (idempotently) when they recover.
+		coordination.clearOwner();
+		coordination.clearRolloverOwnerLatch();
+	});
+}

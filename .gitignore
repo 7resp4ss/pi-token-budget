@@ -1,0 +1,9 @@
+node_modules/
+*.tgz
+npm-debug.log*
+.npmrc
+.env
+.env.*
+.DS_Store
+*.doc
+*.docx
