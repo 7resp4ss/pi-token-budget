@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Restore advisory wording for incremental notes in system guidance and new-window bootstraps. Ordinary replies do not require a note write; checkpoint requirements before rollover remain in place.
+
 ## 2.0.2 — 2026-11-06
 
 - Fix the spurious `Compaction cancelled` error on successful manual `/compact`. The native compaction now waits for the checkpoint run to settle and completes in the same attempt. Preserve checkpoint fencing, Esc cancellation, saved-note retries, and fresh-window notes discovery; decline nested automatic compaction while the checkpoint is running.

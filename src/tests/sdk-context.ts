@@ -63,7 +63,7 @@ try {
 	const first = JSON.stringify(snapshots[0]);
 	assert.match(first, /FOREIGN_SYSTEM_RULE/);
 	assert.match(first, /<pi_token_budget_guidance>/);
-	assert.ok(providerSystemText(snapshots[0]).includes("Take incremental notes while you work so you do not miss important info."));
+	assert.ok(providerSystemText(snapshots[0]).includes("It is a good idea to take incremental notes while you work so that you do not miss any important info."));
 	// Pi 0.84 uses context.tools; Pi 1.5 declares tools on system messages.
 	type ProviderTool = { name: string; parameters: unknown };
 	const providerContext = snapshots[0] as { tools?: ProviderTool[]; messages: Array<{ role: string; toolsAdded?: ProviderTool[] }> };

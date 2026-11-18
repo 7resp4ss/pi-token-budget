@@ -122,7 +122,7 @@ Codex 参考实现的 workflow guidance 进入 **developer** 指导，不是 sys
 
 进入 system 的是稳定工作流、两个 namespace 的原始说明、11 个工具的名字映射、fence 和恢复规则。动态的 agent/window identity、reminder、fallback、manual-checkpoint、continuation 继续使用受这些规则约束的 custom 消息，display=false。当前窗口身份在每次 context 回调刷新，避免同一个 run 内自动换窗后 systemPrompt 中出现过期 window ID。新 Pi 的前导 system/developer 消息顺序得到保留。
 
-增量笔记的工作流恢复为直接指令 `Take incremental notes while you work so you do not miss important info.`。它要求工作时持续记录，不再使用 `It is a good idea...` 的建议式措辞。这是提示词要求；当前没有新增每次最终回复之前强制写 notes 的完成检查。
+增量笔记的工作流使用原先的建议式措辞 `It is a good idea to take incremental notes while you work so that you do not miss any important info.`。system 指导与新窗口 bootstrap 都采用建议语气，普通工作中由模型按需记录任务上下文，不要求每轮或每次最终回复前写 notes。换窗前仍需保存 checkpoint；手动 /compact 和预算耗尽时的 checkpoint fence 继续生效。
 
 每次生成新窗口 bootstrap 时，从当前 agent 的 NotesStore 读取真实文件元数据，按更新时间倒序追加 `Existing notes for <agent> at this context-window reset` 索引。每行 JSON 包含可直接传给 notes_read_file 的完整虚拟路径、bytes 和 updated_at；不读取或注入笔记正文，不将目录快照放进 system。子 agent 只列自己的 notes，其他 agent 的笔记仍通过显式路径访问。
 

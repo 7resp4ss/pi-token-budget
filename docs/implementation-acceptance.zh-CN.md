@@ -1,6 +1,6 @@
 # 实现验收记录
 
-验收日期：2026-11-06。本报告针对 2.0.2 的 11 工具实现，包含明文参数和手动压缩修复。发布内容已移除旧四工具版本的 fidelity-review/evidence/probes。
+验收日期：2026-11-06。本报告针对 2.0.2 的 11 工具实现，包含明文参数和手动压缩修复，并记录当前尚未发布的建议式笔记提示调整。发布内容已移除旧四工具版本的 fidelity-review/evidence/probes。
 
 结论：11 个独立函数及计划中的共享恢复能力已落盘。所有函数 description、原始参数定义和 executionMode 与冻结参考逐项比较通过。Pi 平铺命名、notes 字符分页、system 指导和 deliberate checkpoint fence 为明确保留的适配，不将此结果解读为整个 Codex token-budget 后端 100% 复刻。
 
@@ -29,7 +29,7 @@
 
 ## 增量笔记与新窗口 notes 发现
 
-system 工作流使用直接指令 `Take incremental notes while you work so you do not miss important info.`。每次新窗口 bootstrap 另行列出当前 agent 在换窗时已有的 notes：完整虚拟路径、字节大小、更新时间，最近更新优先。最多 25 个文件、整个 notes 索引最多 6000 字符，完整行停止并提示如何查找省略项。空目录和目录读取失败分别说明；读取失败不阻塞换窗。笔记正文保持按需读取，文件元数据不进入 system。
+当前尚未发布的调整将 system 工作流还原为建议式提示 `It is a good idea to take incremental notes while you work so that you do not miss any important info.`，新窗口 bootstrap 同样采用建议语气。普通工作按需记笔记；换窗前仍要求保存 checkpoint。每次新窗口 bootstrap 另行列出当前 agent 在换窗时已有的 notes：完整虚拟路径、字节大小、更新时间，最近更新优先。最多 25 个文件、整个 notes 索引最多 6000 字符，完整行停止并提示如何查找省略项。空目录和目录读取失败分别说明；读取失败不阻塞换窗。笔记正文保持按需读取，文件元数据不进入 system。
 
 integration 验证真实目录中的新旧 notes 排序、引号/换行路径的 JSON 完整性、将返回路径原样传给 notes_read_file、数量/字符上限、空目录与目录读取错误。sdk-context 验证手动 checkpoint 自动换窗后，真实 provider context 收到实际存在的 `/root/notes/checkpoint`（没有假设 `.md` 文件名），并通过该路径成功恢复 checkpoint 正文。该测试同时确认正文不进入 bootstrap，文件索引不进入 system。这里验证的是提示词投递和恢复路径；不宣称已强制每次最终回复前记笔记，也不以离线 fake stream 代表真实模型遵从率。
 

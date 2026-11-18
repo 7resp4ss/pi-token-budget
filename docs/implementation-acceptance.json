@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-06T10:03:55.139939Z",
+  "generated_at": "2026-11-06T10:59:20.314993Z",
   "codex_reference_commit": "f3a90545aed3188ee1e5c119ec89a742de399cdc",
   "node": "v24.16.0",
   "definitions": {
@@ -78,7 +78,7 @@
     "src/context-projection.ts": "c4450cb1b17c385ee293e10b3e345503e0ef7b3b914bf8cf1eb77774b023b70f",
     "src/coordination.ts": "57e9163b33595ea2dd12508afc20082d59728ff954a0f5e78a3ead9050068fbb",
     "src/index.ts": "7d783c27b028999e2cc60878f9af82e085fe2a766497f6ca4ee01e60f7b0f766",
-    "src/prompts.ts": "dd95f666e4db83cc900a6f0f70504364c7ef755e314e2a89994ce72e2411a026",
+    "src/prompts.ts": "4375b4d640f9ae8037c125a276de2b3d4e8e93a63e7fe07a8c9b64fc3374ca13",
     "src/state.ts": "f3e645baa97320bce8e9ae79edb8b50998453f9f30623c2cdb5728baf003018a",
     "src/storage.ts": "1a519f82488d393f2c1bbb74f657ef57c28f7a8f864eb7fb919e616522439764",
     "src/stores/history-journal.ts": "ceff0e1de983aca5463d78e459bcd900ca807c8ca4b4c55e738f1d90b9cb355d",
@@ -131,7 +131,7 @@
     }
   },
   "notes_recovery_follow_up": {
-    "restored_instruction": "Take incremental notes while you work so you do not miss important info.",
+    "restored_instruction": "It is a good idea to take incremental notes while you work so that you do not miss any important info.",
     "reset_index": {
       "scope": "Current agent notes, captured at the shared rollover builder; other agents remain explicitly accessible through existing notes tools.",
       "order": "updated_at descending",
@@ -195,5 +195,16 @@
       "Real Pi 1.5.0 TUI: Esc during the checkpoint yields no rollover; a subsequent ordinary prompt completes."
     ],
     "limits": "No online model was called. Pi still shows cancellation when the user aborts or the checkpoint run fails to save. Native preparation still rejects sessions that are too small before invoking the extension."
+  },
+  "advisory_notes_follow_up": {
+    "status": "implemented locally; not yet published",
+    "change": "Restore the original advisory incremental-notes sentence in system guidance and use advisory wording in new-window bootstraps.",
+    "ordinary_work": "The model decides when notes are useful; no note write is required before each reply or final answer.",
+    "rollover": "Existing pre-rollover checkpoint requirements and fallback/manual checkpoint fencing remain in place.",
+    "checks": [
+      "Pinned Pi 0.84.4: typecheck, smoke, and real SDK context tests passed.",
+      "The real SDK received the advisory sentence in provider system guidance and completed manual checkpoint rollover and notes recovery.",
+      "Generated prompt documentation matches current runtime strings; git diff --check passed."
+    ]
   }
 }
